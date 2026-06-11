@@ -413,6 +413,28 @@ combo gets no default and inherits the first item ("T"), which is
 the wrong axis. The 5D TZCYX bug that produced 2560 one-row slices
 on a `(2,5,2,256,256)` file came from exactly this.
 
+## SAM 3 Frame Identity and Annotation Compatibility
+
+SAM 3 propagation outputs use integer frame indices, while the annotator stores
+annotations under image filenames. `FrameSequence` is the translation layer
+between these identities. Its ordering must match Meta's loader: numeric
+filename stems sort numerically; all other names use lexical ordering.
+
+SAM 3 masks must be converted into the existing annotation contract before
+being committed:
+
+```python
+{
+    "segmentation": [x1, y1, x2, y2, ...],
+    "category_id": int,
+    "category_name": str,
+}
+```
+
+Do not introduce a parallel `polygon` field or nested point arrays. Existing
+rendering, area calculation, project persistence, and exporters consume the
+flattened `segmentation` field.
+
 ## Export Format Filename Matching
 
 `export_formats.py` historically looked up image paths via substring

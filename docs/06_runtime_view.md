@@ -132,6 +132,23 @@ User accepts prediction
     └─> Clear SAM state, reset to normal mode
 ```
 
+## SAM 3 Welding Video Tracking
+
+1. The user opens an extracted-frame folder from the Video menu.
+2. `FrameSequence` orders frames exactly as Meta's SAM 3 folder loader does.
+3. The user annotates objects on a starting frame and initializes SAM 3.
+4. The app computes an interior representative point, persistent source ID,
+   and per-run SAM object ID for each selected polygon.
+5. `SAM3Tracker.track_points()` resets the session, submits all object prompts,
+   streams forward propagation on a worker `QThread`, and converts each
+   full-resolution mask to compact polygons before retaining the result.
+6. Returned polygons are mapped back to their classes, committed to later
+   frames, and autosaved.
+
+The prompt frame is not overwritten. Re-running the same source-frame/source-ID
+pair replaces its earlier SAM 3 generated annotations. Opening another frame
+folder or project invalidates the previous video session.
+
 ## LLM-Assisted Detection (Grounding DINO + SAM)
 
 End-to-end flow when the user clicks "Detect Current Image" in the DINO panel:

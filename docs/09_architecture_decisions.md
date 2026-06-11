@@ -378,6 +378,36 @@ no active modal widget, focus not on `QLineEdit`/`QTextEdit`.
 
 ---
 
+## ADR-016: Use SAM 3 Session Predictor with Object Point Prompts
+
+**Status**: Accepted (June 8, 2026)
+
+**Context**: The welding workflow starts with manually labeled polygons and
+must propagate several independently labeled objects through extracted video
+frames. Meta's dense SAM 3 box prompt is a semantic visual prompt, resets dense
+tracking state, and does not provide a one-box-to-one-object-ID contract.
+
+**Decision**: Integrate Meta SAM 3 through `build_sam3_video_predictor` and its
+session request API. Convert each source polygon to an interior representative
+point, submit it with an explicit object ID, propagate forward, and store masks
+using the existing flattened `segmentation` annotation schema.
+
+**Consequences**:
+- Multiple labeled objects retain independent object IDs and classes.
+- Existing project saving, rendering, and export code remains reusable.
+- A single interior point can be ambiguous for difficult welding imagery, so
+  users must review results and future work may add interactive corrections.
+- SAM 3 remains optional and has stricter CUDA/Python requirements than the
+  base annotator.
+- When neither `cc_torch` nor Triton is available, the adapter uses Meta's
+  slower CPU connected-components fallback so interactive prompts work on
+  Windows without modifying the installed SAM 3 package.
+
+**Related**: `sam3_tracker.py`, `video_sequence.py`, and
+[SAM 3 Welding Video Annotator Adaptation](SAM3_WELDING_VIDEO_ADAPTATION.md).
+
+---
+
 ## Decisions Under Consideration
 
 ### Consider pytest-qt for Utility Testing

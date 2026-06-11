@@ -194,6 +194,18 @@ Each tool is a standalone dialog/window:
 | `dicom_converter.py` | DICOM to TIFF | Preserve metadata, export to JSON |
 | `yolo_trainer.py` | Model training | Train YOLO, load predictions |
 
+### Welding Video and SAM 3 Components
+
+| Module | Responsibility |
+|--------|----------------|
+| `video_sequence.py` | Loads extracted frames using Meta SAM 3's ordering and maps names to tracker indices. |
+| `sam3_tracker.py` | Wraps Meta's session-based SAM 3 video predictor, propagates object-ID point prompts, and converts masks to flattened polygons. |
+| `welding_defaults.py` | Defines welding annotation classes and colors. |
+
+SAM 3 remains separate from `SAMUtils`: SAM 2 owns single-image assistance,
+while `SAM3Tracker` owns an optional Meta SAM 3 video session. Both use the
+existing `_run_sync` worker-thread pattern.
+
 ## Data Model
 
 ### Project JSON Structure

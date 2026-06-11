@@ -59,6 +59,12 @@ desktop.ini
 # Logs
 *.log
 
+# Personal project-defense and interview-prep artifacts
+docs/SAM3_PROJECT_DEFENSE_GUIDE.docx
+docs/.defense-render/
+scripts/build_sam3_defense_doc.py
+~$*.docx
+
 # Environment / secrets
 .env
 .env.local

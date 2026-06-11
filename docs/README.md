@@ -4,6 +4,8 @@ Architecture documentation for the DigitalSreeni Image Annotator project, follow
 
 ## Documentation Index
 
+Project-specific guide: [SAM 3 Welding Video Annotator Adaptation](SAM3_WELDING_VIDEO_ADAPTATION.md)
+
 | # | Section | Description |
 |---|---------|-------------|
 | 1 | [Introduction and Goals](01_introduction_and_goals.md) | Overview, features, quality goals, stakeholders |
