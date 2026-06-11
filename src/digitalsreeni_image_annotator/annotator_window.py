@@ -1,10 +1,13 @@
 import copy
+import filecmp
 import json
 import os
 import shutil
 import traceback
+import uuid
 import warnings
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -50,9 +53,10 @@ from PyQt6.QtWidgets import (
     QSlider,
     QTextEdit,
     QVBoxLayout,
+    QFrame,
     QWidget,
 )
-from shapely.geometry import MultiPolygon, Point, Polygon
+from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
 from tifffile import TiffFile
@@ -84,7 +88,7 @@ from .import_formats import (
     import_yolo_v5plus,
     process_import_format,
 )
-from .sam_utils import InferenceBusyError, SAMUtils
+from .sam_utils import InferenceBusyError, SAMUtils, _run_sync
 from .slice_registration import SliceRegistrationTool
 from .snake_game import SnakeGame
 from .soft_dark_stylesheet import soft_dark_stylesheet
@@ -92,6 +96,8 @@ from .stack_interpolator import StackInterpolator
 from .stack_to_slices import show_stack_to_slices
 from .utils import calculate_area, calculate_bbox
 from .yolo_trainer import LoadPredictionModelDialog, TrainingInfoDialog, YOLOTrainer
+from .video_sequence import FrameSequence
+from .welding_defaults import WELDING_CLASSES
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -306,6 +312,10 @@ class ImageAnnotator(QMainWindow):
         self.yolo_trainer = None
         self.setup_yolo_menu()
 
+        self.frame_sequence = None
+        self.sam3_tracker = None
+        self._sam3_inference_in_flight = False
+
         # F2 → Snake game (Easter egg). Registered as a global QShortcut
         # so it fires regardless of which widget has focus — putting it
         # in keyPressEvent didn't work because QTableWidget (DINO
@@ -314,6 +324,19 @@ class ImageAnnotator(QMainWindow):
         self._snake_shortcut = QShortcut(QKeySequence("F2"), self)
         self._snake_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._snake_shortcut.activated.connect(self.launch_snake_game)
+
+        self._video_shortcuts = []
+        for key, callback in (
+            ("A", self.go_to_previous_frame),
+            ("D", self.go_to_next_frame),
+            ("C", self.copy_selected_annotation_to_next_frame),
+        ):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(
+                lambda callback=callback: self._trigger_video_shortcut(callback)
+            )
+            self._video_shortcuts.append(shortcut)
 
         # Enter/Escape for DINO temp_annotations need to work even when
         # focus is on slice_list / image_list / a button — none of which
@@ -358,6 +381,9 @@ class ImageAnnotator(QMainWindow):
             self.setWindowTitle(base_title)
 
     def new_project(self):
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+            return
         self.remove_all_temp_annotations()  # Remove temp annotations from the previous project
         project_file, _ = QFileDialog.getSaveFileName(
             self, "Create New Project", "", "Image Annotator Project (*.iap)"
@@ -399,11 +425,17 @@ class ImageAnnotator(QMainWindow):
             self.update_window_title()
 
     def show_project_search(self):
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+            return
         from .project_search import show_project_search
 
         show_project_search(self)
 
     def open_project(self):
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+            return
         print("open_project method called")  # Debug print
         self.remove_all_temp_annotations()  # Remove temp annotations from the previous project
         project_file, _ = QFileDialog.getOpenFileName(
@@ -449,6 +481,9 @@ class ImageAnnotator(QMainWindow):
                 print(f"Failed to restore from backup: {str(e)}")
 
     def open_specific_project(self, project_file):
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+            return
         print(f"Opening specific project: {project_file}")  # Debug print
         if os.path.exists(project_file):
             try:
@@ -727,6 +762,9 @@ class ImageAnnotator(QMainWindow):
             print("Invalid class index")
 
     def close_project(self):
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+            return
         if hasattr(self, "current_project_file"):
             reply = QMessageBox.question(
                 self,
@@ -1336,6 +1374,9 @@ class ImageAnnotator(QMainWindow):
                 self.all_images.append(info)
 
     def closeEvent(self, event):
+        if self._sam3_inference_in_flight:
+            event.ignore()
+            return
         if not self.image_label.check_unsaved_changes():
             event.ignore()
             return
@@ -1364,6 +1405,8 @@ class ImageAnnotator(QMainWindow):
         event.accept()
 
     def switch_slice(self, item):
+        if self._sam3_inference_in_flight:
+            return
         if item is None:
             return
         if not self.image_label.check_unsaved_changes():
@@ -1421,6 +1464,8 @@ class ImageAnnotator(QMainWindow):
         self._refresh_dino_temp_for_current()
 
     def switch_image(self, item):
+        if self._sam3_inference_in_flight:
+            return
         if item is None:
             return
         if not self.image_label.check_unsaved_changes():
@@ -1966,6 +2011,12 @@ class ImageAnnotator(QMainWindow):
                 self.delete_selected_annotations()
             elif self.image_list.hasFocus() and self.image_list.currentItem():
                 self.delete_selected_image()
+        elif event.key() == Qt.Key.Key_A:
+            self.go_to_previous_frame()
+        elif event.key() == Qt.Key.Key_D:
+            self.go_to_next_frame()
+        elif event.key() == Qt.Key.Key_C:
+            self.copy_selected_annotation_to_next_frame()
         elif event.key() == Qt.Key.Key_Up or event.key() == Qt.Key.Key_Down:
             # Handle slice navigation
             if self.slice_list.hasFocus():
@@ -1997,6 +2048,12 @@ class ImageAnnotator(QMainWindow):
             # Pass any other key events to the parent for default handling
             super().keyPressEvent(event)
 
+    def _trigger_video_shortcut(self, callback):
+        focused_widget = QApplication.focusWidget()
+        if isinstance(focused_widget, (QLineEdit, QTextEdit)):
+            return
+        callback()
+
     def has_visible_temp_classes(self):
         for i in range(self.class_list.count()):
             item = self.class_list.item(i)
@@ -2012,6 +2069,8 @@ class ImageAnnotator(QMainWindow):
         self.snake_game.setFocus()
 
     def import_annotations(self):
+        if self._reject_while_sam3_busy():
+            return
         if not self.image_label.check_unsaved_changes():
             return
         print("Starting import_annotations")
@@ -2543,6 +2602,30 @@ class ImageAnnotator(QMainWindow):
     def create_menu_bar(self):
         menu_bar = self.menuBar()
 
+        # Video Menu
+        video_menu = menu_bar.addMenu("&Video")
+        open_folder_action = QAction("Open Frame &Folder...", self)
+        open_folder_action.triggered.connect(self.open_frame_folder)
+        video_menu.addAction(open_folder_action)
+
+        next_frame_action = QAction("&Next Frame (D)", self)
+        next_frame_action.triggered.connect(self.go_to_next_frame)
+        video_menu.addAction(next_frame_action)
+
+        prev_frame_action = QAction("&Previous Frame (A)", self)
+        prev_frame_action.triggered.connect(self.go_to_previous_frame)
+        video_menu.addAction(prev_frame_action)
+
+        copy_anno_action = QAction("&Copy Selected Annotation to Next Frame (C)", self)
+        copy_anno_action.triggered.connect(self.copy_selected_annotation_to_next_frame)
+        video_menu.addAction(copy_anno_action)
+
+        # Welding Menu
+        welding_menu = menu_bar.addMenu("&Welding")
+        add_welding_action = QAction("Add &Default Welding Classes", self)
+        add_welding_action.triggered.connect(self.add_default_welding_classes)
+        welding_menu.addAction(add_welding_action)
+
         # Project Menu
         project_menu = menu_bar.addMenu("&Project")
 
@@ -2664,8 +2747,14 @@ class ImageAnnotator(QMainWindow):
         base together exhaust VRAM. After unload, the next inference
         call will re-load the model from disk (~1-3 s).
         """
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+            return
         self.sam_utils.unload()
         self.dino_utils.unload()
+        if self.sam3_tracker is not None:
+            self.sam3_tracker.unload()
+            self.sam3_tracker = None
         # Reset the dropdowns to a neutral state so the user knows they
         # need to re-pick the model.
         self.sam_model_selector.setCurrentIndex(0)
@@ -2678,7 +2767,7 @@ class ImageAnnotator(QMainWindow):
         QMessageBox.information(
             self,
             "Models Unloaded",
-            "SAM and DINO models have been unloaded from memory.\n\n"
+            "SAM, SAM 3, and DINO models have been unloaded from memory.\n\n"
             "Note: PyTorch keeps a per-process CUDA context that survives "
             "this unload (typically a few hundred MB visible in Task Manager / "
             "nvidia-smi). To fully reclaim GPU memory, restart the app.\n\n"
@@ -2784,6 +2873,26 @@ class ImageAnnotator(QMainWindow):
         self.sam_model_selector.currentTextChanged.connect(self.change_sam_model)
         sam_layout.addWidget(self.sam_model_selector)
 
+        # SAM 3 Tracking Video Tools
+        sam3_label = QLabel("SAM 3 Video Tracking:")
+        sam3_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        sam_layout.addWidget(sam3_label)
+
+        self.sam3_init_btn = QPushButton("Load Video Frames to SAM 3")
+        self.sam3_init_btn.clicked.connect(self.init_sam3_tracker)
+        sam_layout.addWidget(self.sam3_init_btn)
+
+        sam3_buttons_layout = QHBoxLayout()
+        self.sam3_track_forward_btn = QPushButton("Track Selected Forward")
+        self.sam3_track_forward_btn.clicked.connect(self.sam3_track_forward)
+
+        self.sam3_track_all_btn = QPushButton("Track All Objects")
+        self.sam3_track_all_btn.clicked.connect(lambda: self.sam3_track_forward(all_objects=True))
+
+        sam3_buttons_layout.addWidget(self.sam3_track_forward_btn)
+        sam3_buttons_layout.addWidget(self.sam3_track_all_btn)
+        sam_layout.addLayout(sam3_buttons_layout)
+
         annotation_layout.addWidget(sam_widget)
 
         # --- LLM-Assisted Detection (DINO) subsection ---
@@ -2870,14 +2979,23 @@ class ImageAnnotator(QMainWindow):
         self.eraser_button.clicked.connect(self.toggle_tool)
         self.sam_magic_wand_button.clicked.connect(self.toggle_tool)
 
-        # Annotations list subsection
-        annotation_layout.addWidget(QLabel("Annotations"))
+        # Wrap the annotation tools in a scroll area so they don't get squashed
+        tools_scroll = QScrollArea()
+        tools_scroll.setWidgetResizable(True)
+        tools_scroll.setWidget(annotation_widget)
+        tools_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Give it a reasonable minimum height so it doesn't completely collapse
+        tools_scroll.setMinimumHeight(250)
+        self.sidebar_layout.addWidget(tools_scroll)
+
+        # Annotations list subsection (added directly to sidebar_layout so it expands properly)
+        self.sidebar_layout.addWidget(QLabel("Annotations"))
         self.annotation_list = QListWidget()
         self.annotation_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.annotation_list.itemSelectionChanged.connect(
             self.update_highlighted_annotations
         )
-        annotation_layout.addWidget(self.annotation_list)
+        self.sidebar_layout.addWidget(self.annotation_list)
 
         # Create a horizontal layout for the sort buttons
         sort_button_layout = QHBoxLayout()
@@ -2890,8 +3008,8 @@ class ImageAnnotator(QMainWindow):
         self.sort_by_area_button.clicked.connect(self.sort_annotations_by_area)
         sort_button_layout.addWidget(self.sort_by_area_button)
 
-        # Add the sort button layout to the annotation layout
-        annotation_layout.addLayout(sort_button_layout)
+        # Add the sort button layout to the sidebar layout
+        self.sidebar_layout.addLayout(sort_button_layout)
 
         # Delete and Merge annotation buttons
         self.delete_button = QPushButton("Delete")
@@ -2907,8 +3025,8 @@ class ImageAnnotator(QMainWindow):
         button_layout.addWidget(self.merge_button)
         button_layout.addWidget(self.change_class_button)
 
-        # Add the button layout to the annotation layout
-        annotation_layout.addLayout(button_layout)
+        # Add the button layout to the sidebar layout
+        self.sidebar_layout.addLayout(button_layout)
 
         # Add export format selector
         self.export_format_selector = QComboBox()
@@ -2920,15 +3038,12 @@ class ImageAnnotator(QMainWindow):
         self.export_format_selector.addItem("Pascal VOC (BBox)")
         self.export_format_selector.addItem("Pascal VOC (BBox + Segmentation)")
 
-        annotation_layout.addWidget(QLabel("Export Format:"))
-        annotation_layout.addWidget(self.export_format_selector)
+        self.sidebar_layout.addWidget(QLabel("Export Format:"))
+        self.sidebar_layout.addWidget(self.export_format_selector)
 
         self.export_button = QPushButton("Export Annotations")
         self.export_button.clicked.connect(self.export_annotations)
-        annotation_layout.addWidget(self.export_button)
-
-        # Add the annotation widget to the sidebar
-        self.sidebar_layout.addWidget(annotation_widget)
+        self.sidebar_layout.addWidget(self.export_button)
 
     def toggle_sam_box(self):
         if self.sam_box_button.isChecked():
@@ -3552,8 +3667,10 @@ class ImageAnnotator(QMainWindow):
         for i in range(self.image_list.count()):
             item = self.image_list.item(i)
             if item and item.text() == name:
-                self.image_list.setCurrentRow(i)
-                self.switch_image(item)
+                if self.image_list.currentRow() == i:
+                    self.switch_image(item)
+                else:
+                    self.image_list.setCurrentRow(i)
                 return True
         # Slice — find which multi-dim image contains it, switch to
         # that parent image first, then activate the specific slice
@@ -3844,6 +3961,9 @@ class ImageAnnotator(QMainWindow):
             self.add_images_to_list(file_names)
 
     def clear_all(self, new_project=False, show_messages=True):
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+            return
         if not new_project and show_messages:
             reply = self.show_question(
                 "Clear All",
@@ -3851,6 +3971,8 @@ class ImageAnnotator(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+
+        self._reset_sam3_video_state(unload=True)
 
         # Clear images
         self.image_list.clear()
@@ -3934,6 +4056,12 @@ class ImageAnnotator(QMainWindow):
 
     def show_warning(self, title, message):
         QMessageBox.warning(self, title, message)
+
+    def _reject_while_sam3_busy(self):
+        if not self._sam3_inference_in_flight:
+            return False
+        self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+        return True
 
     def show_info(self, title, message):
         QMessageBox.information(self, title, message)
@@ -4080,6 +4208,8 @@ class ImageAnnotator(QMainWindow):
             )
 
     def remove_image(self):
+        if self._reject_while_sam3_busy():
+            return
         current_item = self.image_list.currentItem()
         if current_item:
             file_name = current_item.text()
@@ -4132,6 +4262,8 @@ class ImageAnnotator(QMainWindow):
             self.auto_save()  # Auto-save after removing an image
 
     def load_annotations(self):
+        if self._reject_while_sam3_busy():
+            return
         file_name, _ = QFileDialog.getOpenFileName(
             self, "Load Annotations", "", "JSON Files (*.json)"
         )
@@ -4279,6 +4411,8 @@ class ImageAnnotator(QMainWindow):
         self.update_annotation_list()
 
     def delete_selected_annotations(self):
+        if self._reject_while_sam3_busy():
+            return
         selected_items = self.annotation_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(
@@ -4330,6 +4464,8 @@ class ImageAnnotator(QMainWindow):
             self.auto_save()  # Auto-save after deleting annotations
 
     def merge_annotations(self):
+        if self._reject_while_sam3_busy():
+            return
         if self.image_label.editing_polygon is not None:
             QMessageBox.warning(
                 self,
@@ -4473,6 +4609,8 @@ class ImageAnnotator(QMainWindow):
         self.auto_save()  # Auto-save after merging annotations
 
     def delete_selected_image(self):
+        if self._sam3_inference_in_flight:
+            return
         current_item = self.image_list.currentItem()
         if current_item:
             file_name = current_item.text()
@@ -4704,6 +4842,8 @@ class ImageAnnotator(QMainWindow):
         self.image_label.update()
 
     def change_annotation_class(self):
+        if self._reject_while_sam3_busy():
+            return
         selected_items = self.annotation_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(
@@ -4954,6 +5094,8 @@ class ImageAnnotator(QMainWindow):
             self.auto_save()  # Auto-save after changing class color
 
     def rename_class(self, item):
+        if self._sam3_inference_in_flight:
+            return
         old_name = item.text()
         new_name, ok = QInputDialog.getText(
             self, "Rename Class", "Enter new class name:", text=old_name
@@ -5009,6 +5151,8 @@ class ImageAnnotator(QMainWindow):
             print(f"Class renamed from '{old_name}' to '{new_name}'")
 
     def delete_class(self, item=None):
+        if self._sam3_inference_in_flight:
+            return
         if item is None:
             item = self.class_list.currentItem()
 
@@ -5882,6 +6026,285 @@ class ImageAnnotator(QMainWindow):
                 return True
             return False
         return True
+
+    def add_default_welding_classes(self):
+        for class_name, color in WELDING_CLASSES:
+            if class_name not in self.class_mapping:
+                self.add_class(class_name, color)
+        self.show_info("Welding Classes", "Added default welding classes.")
+
+    def _reset_sam3_video_state(self, unload=False):
+        if self.sam3_tracker is not None:
+            if unload:
+                self.sam3_tracker.unload()
+                self.sam3_tracker = None
+            else:
+                self.sam3_tracker.close_session()
+        self.frame_sequence = None
+
+    def _sam3_frame_name_conflicts(self, frame_sequence):
+        conflicts = []
+        for frame in frame_sequence.frames:
+            existing_path = self.image_paths.get(frame.name)
+            if not existing_path:
+                continue
+            existing_path = Path(existing_path)
+            if existing_path.resolve() == frame.path.resolve():
+                continue
+            try:
+                is_same_frame = filecmp.cmp(existing_path, frame.path, shallow=False)
+            except OSError:
+                is_same_frame = False
+            if not is_same_frame:
+                conflicts.append(frame.name)
+        return conflicts
+
+    def open_frame_folder(self):
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Select Video Frame Folder")
+        if folder:
+            try:
+                frame_sequence = FrameSequence.from_folder(folder)
+                conflicts = self._sam3_frame_name_conflicts(frame_sequence)
+                if conflicts:
+                    preview = ", ".join(conflicts[:5])
+                    raise ValueError(
+                        "Frame names collide with images already loaded from "
+                        f"another folder: {preview}"
+                    )
+                self._reset_sam3_video_state()
+                self.frame_sequence = frame_sequence
+                image_paths = [str(f.path) for f in frame_sequence.frames]
+                self.add_images_to_list(image_paths)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load frame folder: {str(e)}")
+
+    def go_to_next_frame(self):
+        if self._sam3_inference_in_flight:
+            return
+        if not self.frame_sequence:
+            return
+        frame_idx = self.frame_sequence.index_for_name(self.image_file_name)
+        next_name = self.frame_sequence.name_for_index(frame_idx + 1) if frame_idx is not None else None
+        if next_name:
+            self._navigate_to_image_or_slice(next_name)
+
+    def go_to_previous_frame(self):
+        if self._sam3_inference_in_flight:
+            return
+        if not self.frame_sequence:
+            return
+        frame_idx = self.frame_sequence.index_for_name(self.image_file_name)
+        previous_name = self.frame_sequence.name_for_index(frame_idx - 1) if frame_idx is not None else None
+        if previous_name:
+            self._navigate_to_image_or_slice(previous_name)
+
+    def copy_selected_annotation_to_next_frame(self):
+        if self._sam3_inference_in_flight:
+            return
+        if not self.image_list.currentItem():
+            return
+
+        selected_items = self.annotation_list.selectedItems()
+        if not selected_items:
+            self.show_warning("Copy Annotation", "No annotation selected.")
+            return
+
+        if not self.frame_sequence:
+            return
+        current_image_name = self.image_file_name
+        current_frame_idx = self.frame_sequence.index_for_name(current_image_name)
+        next_image_name = (
+            self.frame_sequence.name_for_index(current_frame_idx + 1)
+            if current_frame_idx is not None
+            else None
+        )
+        if not next_image_name:
+            return
+
+        self.save_current_annotations()
+        for item in selected_items:
+            annotation = copy.deepcopy(item.data(Qt.ItemDataRole.UserRole))
+            class_name = annotation.get("category_name")
+            if not class_name:
+                continue
+            for key in (
+                "source",
+                "sam3_source_frame",
+                "sam3_source_id",
+                "sam3_object_id",
+            ):
+                annotation.pop(key, None)
+            self.all_annotations.setdefault(next_image_name, {}).setdefault(
+                class_name, []
+            ).append(annotation)
+
+        self.auto_save()
+        self.go_to_next_frame()
+
+    def init_sam3_tracker(self):
+        if not self.frame_sequence:
+            self.show_warning("SAM 3 Tracker", "Please open a Frame Folder first.")
+            return
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "SAM 3 is already busy.")
+            return
+
+        try:
+            self._sam3_inference_in_flight = True
+            self.setCursor(Qt.CursorShape.WaitCursor)
+            from .sam3_tracker import SAM3Tracker
+
+            if self.sam3_tracker is None:
+                ckpt_path = Path(__file__).resolve().parents[3] / "sam3-001.pt"
+                if not ckpt_path.exists():
+                    selected_path, _ = QFileDialog.getOpenFileName(
+                        self,
+                        "Select SAM 3 Checkpoint",
+                        "",
+                        "PyTorch Models (*.pt *.pth)",
+                    )
+                    if not selected_path:
+                        return
+                    ckpt_path = Path(selected_path)
+                self.sam3_tracker = _run_sync(SAM3Tracker, str(ckpt_path))
+
+            folder_path = str(self.frame_sequence.folder)
+            _run_sync(self.sam3_tracker.init_state, folder_path)
+            self.show_info("SAM 3 Tracker", "Successfully loaded frames into SAM 3 Tracker.")
+        except InferenceBusyError:
+            self.show_warning("SAM 3 Tracker", "Another AI inference is still running.")
+        except Exception as e:
+            QMessageBox.critical(self, "SAM 3 Error", f"Failed to initialize tracker:\n{str(e)}")
+        finally:
+            self._sam3_inference_in_flight = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def sam3_track_forward(self, all_objects=False):
+        if self.sam3_tracker is None or not self.sam3_tracker.is_initialized:
+            self.show_warning("SAM 3 Tracker", "Please initialize the tracker first.")
+            return
+        if self._sam3_inference_in_flight:
+            self.show_warning("SAM 3 Tracker", "SAM 3 is already busy.")
+            return
+
+        current_image_name = self.image_file_name
+        current_idx = self.frame_sequence.index_for_name(current_image_name)
+        if current_idx is None:
+            self.show_warning("Tracking", "The current image is not part of the open frame folder.")
+            return
+
+        self.save_current_annotations()
+        current_annotations = self.all_annotations.get(current_image_name, {})
+        if not current_annotations:
+            self.show_warning("Tracking", "No annotations on current frame to track.")
+            return
+
+        if all_objects:
+            targets = [
+                (class_name, annotation)
+                for class_name, annotations in current_annotations.items()
+                for annotation in annotations
+            ]
+        else:
+            targets = []
+            for item in self.annotation_list.selectedItems():
+                selected = item.data(Qt.ItemDataRole.UserRole)
+                class_name = selected.get("category_name")
+                if not class_name:
+                    continue
+                for annotation in current_annotations.get(class_name, []):
+                    if annotation is selected or (
+                        annotation.get("number") == selected.get("number")
+                        and annotation.get("segmentation") == selected.get("segmentation")
+                    ):
+                        targets.append((class_name, annotation))
+                        break
+
+        objects_to_track = {}
+        object_points = []
+        for object_id, (class_name, annotation) in enumerate(targets, start=1):
+            segmentation = annotation.get("segmentation")
+            if not segmentation or len(segmentation) < 6:
+                continue
+            polygon = make_valid(Polygon(np.asarray(segmentation).reshape(-1, 2)))
+            if polygon.is_empty:
+                continue
+            if isinstance(polygon, MultiPolygon):
+                polygon = max(polygon.geoms, key=lambda item: item.area)
+            if not isinstance(polygon, Polygon):
+                continue
+            source_id = annotation.setdefault("sam3_source_id", uuid.uuid4().hex)
+            prompt = polygon.representative_point()
+            object_points.append((object_id, (prompt.x, prompt.y)))
+            objects_to_track[object_id] = (class_name, source_id)
+
+        if not objects_to_track:
+            message = (
+                "No valid polygon annotations selected."
+                if not all_objects
+                else "No valid polygon annotations to track."
+            )
+            self.show_warning("Tracking", message)
+            return
+
+        next_name = None
+        try:
+            self._sam3_inference_in_flight = True
+            self.setCursor(Qt.CursorShape.WaitCursor)
+            results = _run_sync(self.sam3_tracker.track_points, current_idx, object_points)
+            for out_frame_idx, segmentations_by_object in results:
+                if out_frame_idx == current_idx:
+                    continue
+                frame_name = self.frame_sequence.name_for_index(out_frame_idx)
+                if not frame_name:
+                    continue
+                frame_annotations = self.all_annotations.setdefault(frame_name, {})
+
+                for object_id, segmentations in segmentations_by_object.items():
+                    object_info = objects_to_track.get(object_id)
+                    if not object_info:
+                        continue
+                    class_name, source_id = object_info
+                    annotations = frame_annotations.setdefault(class_name, [])
+                    annotations[:] = [
+                        annotation
+                        for annotation in annotations
+                        if not (
+                            annotation.get("source") == "sam3_track"
+                            and annotation.get("sam3_source_frame") == current_image_name
+                            and annotation.get("sam3_source_id") == source_id
+                        )
+                    ]
+
+                    for segmentation in segmentations:
+                        annotations.append(
+                            {
+                                "segmentation": segmentation,
+                                "category_id": self.class_mapping[class_name],
+                                "category_name": class_name,
+                                "source": "sam3_track",
+                                "sam3_source_frame": current_image_name,
+                                "sam3_source_id": source_id,
+                                "sam3_object_id": object_id,
+                            }
+                        )
+
+            self.auto_save()
+            next_name = self.frame_sequence.name_for_index(current_idx + 1)
+            self.update_annotation_list()
+            self.image_label.update()
+        except InferenceBusyError:
+            self.show_warning("SAM 3 Tracker", "Another AI inference is still running.")
+        except Exception as e:
+            QMessageBox.critical(self, "SAM 3 Tracking Error", f"Tracking failed:\n{str(e)}")
+        finally:
+            self._sam3_inference_in_flight = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        if next_name:
+            self._navigate_to_image_or_slice(next_name)
 
     def remove_all_temp_annotations(self):
         for image_name in list(self.all_annotations.keys()):
