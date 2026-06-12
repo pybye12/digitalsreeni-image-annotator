@@ -6059,6 +6059,23 @@ class ImageAnnotator(QMainWindow):
                 conflicts.append(frame.name)
         return conflicts
 
+    def _clear_sam3_tracks_from_sources(self, source_frame, objects_to_track):
+        """Remove prior generated results before replacing a tracking run."""
+        for frame_annotations in self.all_annotations.values():
+            for class_name, source_id in objects_to_track.values():
+                annotations = frame_annotations.get(class_name)
+                if annotations is None:
+                    continue
+                annotations[:] = [
+                    annotation
+                    for annotation in annotations
+                    if not (
+                        annotation.get("source") == "sam3_track"
+                        and annotation.get("sam3_source_frame") == source_frame
+                        and annotation.get("sam3_source_id") == source_id
+                    )
+                ]
+
     def open_frame_folder(self):
         if self._sam3_inference_in_flight:
             self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
@@ -6224,7 +6241,7 @@ class ImageAnnotator(QMainWindow):
                         break
 
         objects_to_track = {}
-        object_points = []
+        object_polygons = []
         for object_id, (class_name, annotation) in enumerate(targets, start=1):
             segmentation = annotation.get("segmentation")
             if not segmentation or len(segmentation) < 6:
@@ -6237,8 +6254,8 @@ class ImageAnnotator(QMainWindow):
             if not isinstance(polygon, Polygon):
                 continue
             source_id = annotation.setdefault("sam3_source_id", uuid.uuid4().hex)
-            prompt = polygon.representative_point()
-            object_points.append((object_id, (prompt.x, prompt.y)))
+            polygon_points = np.asarray(polygon.exterior.coords[:-1]).reshape(-1, 2)
+            object_polygons.append((object_id, polygon_points.flatten().tolist()))
             objects_to_track[object_id] = (class_name, source_id)
 
         if not objects_to_track:
@@ -6254,7 +6271,17 @@ class ImageAnnotator(QMainWindow):
         try:
             self._sam3_inference_in_flight = True
             self.setCursor(Qt.CursorShape.WaitCursor)
-            results = _run_sync(self.sam3_tracker.track_points, current_idx, object_points)
+            tracked_annotation_count = 0
+            frame_size = (self.current_image.width(), self.current_image.height())
+            results = _run_sync(
+                self.sam3_tracker.track_polygons,
+                current_idx,
+                object_polygons,
+                frame_size,
+            )
+            self._clear_sam3_tracks_from_sources(
+                current_image_name, objects_to_track
+            )
             for out_frame_idx, segmentations_by_object in results:
                 if out_frame_idx == current_idx:
                     continue
@@ -6269,15 +6296,6 @@ class ImageAnnotator(QMainWindow):
                         continue
                     class_name, source_id = object_info
                     annotations = frame_annotations.setdefault(class_name, [])
-                    annotations[:] = [
-                        annotation
-                        for annotation in annotations
-                        if not (
-                            annotation.get("source") == "sam3_track"
-                            and annotation.get("sam3_source_frame") == current_image_name
-                            and annotation.get("sam3_source_id") == source_id
-                        )
-                    ]
 
                     for segmentation in segmentations:
                         annotations.append(
@@ -6291,11 +6309,19 @@ class ImageAnnotator(QMainWindow):
                                 "sam3_object_id": object_id,
                             }
                         )
+                        tracked_annotation_count += 1
 
             self.auto_save()
-            next_name = self.frame_sequence.name_for_index(current_idx + 1)
             self.update_annotation_list()
             self.image_label.update()
+            if tracked_annotation_count:
+                next_name = self.frame_sequence.name_for_index(current_idx + 1)
+            else:
+                self.show_warning(
+                    "SAM 3 Tracking",
+                    "SAM 3 could not reproduce the selected large droplet on "
+                    "the source frame. No tracking annotations were saved.",
+                )
         except InferenceBusyError:
             self.show_warning("SAM 3 Tracker", "Another AI inference is still running.")
         except Exception as e:
