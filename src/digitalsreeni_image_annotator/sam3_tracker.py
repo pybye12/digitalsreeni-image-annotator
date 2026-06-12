@@ -308,6 +308,9 @@ class SAM3Tracker:
                     "rel_coordinates": True,
                 }
             )
+            self._replace_tracker_prompt_with_mask(
+                frame_idx, object_id, source_masks[object_id]
+            )
 
         frame_area = frame_width * frame_height
         request = {
@@ -343,6 +346,46 @@ class SAM3Tracker:
             if response["frame_index"] == frame_idx and not active_object_ids:
                 break
         return results
+
+    def _replace_tracker_prompt_with_mask(self, frame_idx, object_id, source_mask):
+        """Seed Meta's tracker from the exact polygon when its mask API exists.
+
+        Meta's session request layer currently exposes text, box, and point
+        prompts but not the underlying tracker's mask prompt. The official
+        model object does expose that capability, so use it defensively while
+        retaining the point prompt as a compatibility fallback.
+        """
+        predictor_states = getattr(self.predictor, "_all_inference_states", None)
+        model = getattr(self.predictor, "model", None)
+        tracker = getattr(model, "tracker", None)
+        get_states = getattr(model, "_get_tracker_inference_states_by_obj_ids", None)
+        add_new_mask = getattr(tracker, "add_new_mask", None)
+        preflight = getattr(tracker, "propagate_in_video_preflight", None)
+        if not (
+            isinstance(predictor_states, dict)
+            and callable(get_states)
+            and callable(add_new_mask)
+            and callable(preflight)
+        ):
+            return False
+
+        session = predictor_states.get(self.session_id)
+        if not isinstance(session, dict) or "state" not in session:
+            return False
+        tracker_states = get_states(session["state"], [object_id])
+        if len(tracker_states) != 1:
+            return False
+
+        try:
+            import torch
+
+            mask_tensor = torch.as_tensor(source_mask, dtype=torch.bool)
+            add_new_mask(tracker_states[0], frame_idx, object_id, mask_tensor)
+            preflight(tracker_states[0], run_mem_encoder=True)
+            return True
+        except Exception as exc:
+            print(f"[SAM3] exact polygon mask seed unavailable: {exc}")
+            return False
 
     @classmethod
     def mask_to_refinement_points(cls, mask, frame_size, positive_count=4):
