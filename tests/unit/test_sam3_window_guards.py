@@ -65,3 +65,33 @@ def test_frame_folder_allows_exact_project_copy_but_rejects_name_collision(tmp_p
 
     (project / "001.png").write_bytes(b"different-frame")
     assert ImageAnnotator._sam3_frame_name_conflicts(window, sequence) == ["001.png"]
+
+
+def test_rejected_rerun_clears_only_its_prior_generated_tracks():
+    keep_manual = {"source": "manual", "sam3_source_id": "source-a"}
+    remove_generated = {
+        "source": "sam3_track",
+        "sam3_source_frame": "001.png",
+        "sam3_source_id": "source-a",
+    }
+    keep_other_track = {
+        "source": "sam3_track",
+        "sam3_source_frame": "001.png",
+        "sam3_source_id": "source-b",
+    }
+    window = SimpleNamespace(
+        all_annotations={
+            "002.png": {
+                "droplet": [keep_manual, remove_generated, keep_other_track],
+            }
+        }
+    )
+
+    ImageAnnotator._clear_sam3_tracks_from_sources(
+        window, "001.png", {1: ("droplet", "source-a")}
+    )
+
+    assert window.all_annotations["002.png"]["droplet"] == [
+        keep_manual,
+        keep_other_track,
+    ]

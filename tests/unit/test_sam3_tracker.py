@@ -14,20 +14,58 @@ class FakePredictor:
         self.requests.append(request)
         if request["type"] == "start_session":
             return {"session_id": "session-1"}
+        if request["type"] == "add_prompt" and "bounding_boxes" in request:
+            first = np.zeros((20, 20), dtype=bool)
+            first[2:8, 2:8] = True
+            second = np.zeros((20, 20), dtype=bool)
+            second[11:18, 11:18] = True
+            return {
+                "outputs": {
+                    "out_obj_ids": np.array([20, 10]),
+                    "out_binary_masks": np.stack([second, first]),
+                }
+            }
         return {"is_success": True}
 
     def handle_stream_request(self, request):
         self.requests.append(request)
+        object_id = next(
+            (
+                previous["obj_id"]
+                for previous in reversed(self.requests)
+                if previous.get("type") == "add_prompt" and "obj_id" in previous
+            ),
+            7,
+        )
+        mask = np.zeros((20, 20), dtype=bool)
+        mask[2:11, 2:11] = True
         yield {
             "frame_index": 3,
             "outputs": {
-                "out_obj_ids": np.array([7]),
-                "out_binary_masks": np.ones((1, 4, 5), dtype=bool),
+                "out_obj_ids": np.array([object_id]),
+                "out_binary_masks": mask[None, ...],
             },
         }
 
     def shutdown(self):
         self.shutdown_called = True
+
+
+class OffTargetPredictor(FakePredictor):
+    def handle_stream_request(self, request):
+        self.requests.append(request)
+        off_target = np.zeros((20, 20), dtype=bool)
+        off_target[11:20, 11:20] = True
+        on_target = np.zeros((20, 20), dtype=bool)
+        on_target[2:11, 2:11] = True
+        for frame_index, mask in [(2, off_target), (3, on_target)]:
+            yield {
+                "frame_index": frame_index,
+                "outputs": {
+                    "out_obj_ids": np.array([7]),
+                    "out_binary_masks": mask[None, ...],
+                },
+            }
 
 
 def test_tracker_uses_supported_session_and_point_prompt_api(tmp_path):
@@ -52,6 +90,18 @@ def test_tracker_uses_supported_session_and_point_prompt_api(tmp_path):
     assert prompt["rel_coordinates"] is False
 
 
+def test_tracker_normalizes_original_image_points(tmp_path):
+    predictor = FakePredictor()
+    tracker = SAM3Tracker("unused.pt", predictor=predictor)
+    tracker.init_state(str(tmp_path))
+
+    tracker.track_points(2, [(7, (100, 50))], frame_size=(200, 100))
+
+    prompt = predictor.requests[2]
+    assert prompt["points"] == [[0.5, 0.5]]
+    assert prompt["rel_coordinates"] is True
+
+
 def test_extract_masks_and_convert_to_annotator_segmentation():
     mask = np.zeros((20, 20), dtype=bool)
     mask[3:12, 5:15] = True
@@ -67,6 +117,150 @@ def test_extract_masks_and_convert_to_annotator_segmentation():
     assert len(segmentations) == 1
     assert len(segmentations[0]) >= 6
     assert all(isinstance(value, int) for value in segmentations[0])
+
+
+def test_tracker_uses_boxes_and_maps_model_ids_back_to_requested_ids(tmp_path):
+    predictor = FakePredictor()
+    tracker = SAM3Tracker("unused.pt", predictor=predictor)
+    tracker.init_state(str(tmp_path))
+
+    results = tracker.track_boxes(
+        2,
+        [(7, (1, 1, 8, 8)), (9, (10, 10, 9, 9))],
+        (20, 20),
+    )
+
+    prompt = predictor.requests[2]
+    assert prompt["bounding_boxes"] == [
+        [0.05, 0.05, 0.4, 0.4],
+        [0.5, 0.5, 0.45, 0.45],
+    ]
+    assert prompt["bounding_box_labels"] == [1, 1]
+    assert set(results[0][1]) == {7}
+
+
+def test_tracker_uses_source_polygon_as_normalized_prompt(tmp_path):
+    predictor = FakePredictor()
+    tracker = SAM3Tracker("unused.pt", predictor=predictor)
+    tracker.init_state(str(tmp_path))
+
+    results = tracker.track_polygons(
+        2,
+        [(7, [2, 2, 12, 2, 12, 12, 2, 12])],
+        (20, 20),
+    )
+
+    prompt = predictor.requests[2]
+    assert prompt["obj_id"] == 7
+    assert prompt["rel_coordinates"] is True
+    assert prompt["point_labels"].count(1) == 6
+    assert prompt["point_labels"].count(0) == 8
+    assert all(0 <= coordinate <= 1 for point in prompt["points"] for coordinate in point)
+    assert set(results[0][1]) == {7}
+
+
+def test_match_output_objects_to_boxes_uses_mask_overlap():
+    first = np.zeros((30, 30), dtype=bool)
+    first[2:10, 2:10] = True
+    second = np.zeros((30, 30), dtype=bool)
+    second[18:27, 18:27] = True
+    outputs = {
+        "out_obj_ids": np.array([41, 42]),
+        "out_binary_masks": np.stack([first, second]),
+    }
+
+    mapping = SAM3Tracker.match_output_objects_to_boxes(
+        outputs, [(5, (0, 0, 12, 12)), (6, (16, 16, 13, 13))]
+    )
+
+    assert mapping == {41: 5, 42: 6}
+
+
+def test_rejects_catastrophic_mask_growth():
+    reasonable = np.zeros((100, 100), dtype=bool)
+    reasonable[10:30, 10:30] = True
+    drifted = np.ones((100, 100), dtype=bool)
+
+    assert SAM3Tracker.is_plausible_tracked_mask(reasonable, 400, 10_000)
+    assert not SAM3Tracker.is_plausible_tracked_mask(drifted, 400, 10_000)
+
+
+def test_refinement_points_are_normalized_and_include_background():
+    mask = np.zeros((100, 200), dtype=bool)
+    mask[30:60, 80:120] = True
+
+    points, labels = SAM3Tracker.mask_to_refinement_points(mask, (200, 100))
+
+    assert len(points) == len(labels)
+    assert labels.count(1) == 4
+    assert labels.count(0) == 8
+    assert all(0 <= coordinate <= 1 for point in points for coordinate in point)
+
+
+def test_largest_component_is_kept_and_small_spatter_is_ignored():
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[20:50, 20:50] = True
+    mask[70:73, 70:73] = True
+
+    segmentation = SAM3Tracker.largest_plausible_segmentation(
+        mask, source_area=900, frame_area=10_000
+    )
+
+    points = np.asarray(segmentation).reshape(-1, 2)
+    assert points[:, 0].max() < 60
+    assert points[:, 1].max() < 60
+
+
+def test_spatter_sized_component_is_rejected_relative_to_source_droplet():
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[40:48, 40:48] = True
+
+    segmentation = SAM3Tracker.largest_plausible_segmentation(
+        mask, source_area=900, frame_area=10_000
+    )
+
+    assert segmentation is None
+
+
+def test_off_target_prompt_frame_rejects_entire_propagation(tmp_path):
+    predictor = OffTargetPredictor()
+    tracker = SAM3Tracker("unused.pt", predictor=predictor)
+    tracker.init_state(str(tmp_path))
+
+    results = tracker.track_polygons(
+        2,
+        [(7, [2, 2, 12, 2, 12, 12, 2, 12])],
+        (20, 20),
+    )
+
+    assert results == [(2, {})]
+
+
+def test_segmentation_overlap_ratio_detects_correct_source_region():
+    source_mask = SAM3Tracker.polygon_to_mask(
+        [2, 2, 12, 2, 12, 12, 2, 12],
+        (20, 20),
+    )
+
+    assert SAM3Tracker.segmentation_overlap_ratio(
+        [3, 3, 11, 3, 11, 11, 3, 11], source_mask
+    ) > 0.9
+    assert (
+        SAM3Tracker.segmentation_overlap_ratio(
+            [14, 14, 19, 14, 19, 19, 14, 19], source_mask
+        )
+        == 0.0
+    )
+
+
+def test_polygon_to_mask_clips_points_to_frame():
+    mask = SAM3Tracker.polygon_to_mask(
+        [-10, -10, 15, -10, 15, 15, -10, 15],
+        (20, 20),
+    )
+
+    assert mask.shape == (20, 20)
+    assert np.count_nonzero(mask) > 0
 
 
 def test_unload_closes_session_and_shuts_down(tmp_path):
