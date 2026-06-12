@@ -80,6 +80,14 @@ Each source annotation therefore receives a persistent `sam3_source_id`.
 Generated results store that identity so a repeated run replaces only results
 belonging to the correct source object.
 
+Droplet sources also store the same identity as `droplet_event_id`. Every mask
+propagated from that source keeps the event ID, so one physical droplet is
+counted once across its full tracked lifetime instead of once per frame. When
+the droplet merges into the weld pool and is missing/rejected for two
+consecutive frames, its track ends and its event remains in the cumulative
+count. The ended identity cannot latch onto a later droplet. A newly formed
+large droplet adds one when the user annotates it and starts a new track.
+
 ### Mask-to-polygon conversion
 
 SAM 3 returns binary masks. OpenCV contour extraction converts each mask into
@@ -152,11 +160,19 @@ model objects to CPU, runs garbage collection, and clears the CUDA allocator.
 The prompt frame is not overwritten. Repeating the same source-frame/source-ID
 run replaces its prior generated annotations rather than appending duplicates.
 
+The Annotation Statistics window reports both **Droplet frame annotations**
+and **Unique tracked droplet events**. The first measures generated mask volume;
+the second is the cumulative large-droplet count. Brand-new droplets are not
+automatically discovered by this visual-tracking workflow and must be marked
+once before their new event can be counted and propagated. After a successful
+droplet tracking run, the UI also reports the updated unique large-droplet
+count immediately.
+
 ## Verification Performed
 
 Automated and integration verification completed during implementation:
 
-- Full pytest suite: 91 tests passed after the tracking/filtering changes.
+- Full pytest suite: 94 tests passed after the tracking/filtering changes.
 - Focused SAM 3 tracker suite: 16 tests passed after the source-overlap gate.
 - Python `compileall` passed.
 - The real local SAM 3 checkpoint loaded on an NVIDIA RTX 3060 Laptop GPU.
