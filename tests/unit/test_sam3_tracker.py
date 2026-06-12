@@ -68,6 +68,29 @@ class OffTargetPredictor(FakePredictor):
             }
 
 
+class MergeThenNewDropletPredictor(FakePredictor):
+    def handle_stream_request(self, request):
+        self.requests.append(request)
+        valid = np.zeros((20, 20), dtype=bool)
+        valid[2:11, 2:11] = True
+        empty = np.zeros((20, 20), dtype=bool)
+        later_new_droplet = np.zeros((20, 20), dtype=bool)
+        later_new_droplet[12:20, 12:20] = True
+        for frame_index, mask in [
+            (2, valid),
+            (3, empty),
+            (4, empty),
+            (5, later_new_droplet),
+        ]:
+            yield {
+                "frame_index": frame_index,
+                "outputs": {
+                    "out_obj_ids": np.array([7]),
+                    "out_binary_masks": mask[None, ...],
+                },
+            }
+
+
 class FakeMaskSeedTracker:
     def __init__(self):
         self.added_masks = []
@@ -274,6 +297,22 @@ def test_off_target_prompt_frame_rejects_entire_propagation(tmp_path):
     )
 
     assert results == [(2, {})]
+
+
+def test_track_ends_after_merge_instead_of_reusing_id_for_new_droplet(tmp_path):
+    predictor = MergeThenNewDropletPredictor()
+    tracker = SAM3Tracker("unused.pt", predictor=predictor)
+    tracker.init_state(str(tmp_path))
+
+    results = tracker.track_polygons(
+        2,
+        [(7, [2, 2, 12, 2, 12, 12, 2, 12])],
+        (20, 20),
+    )
+
+    assert set(results[0][1]) == {7}
+    assert len(results) == 3
+    assert all(not objects for _, objects in results[1:])
 
 
 def test_segmentation_overlap_ratio_detects_correct_source_region():
