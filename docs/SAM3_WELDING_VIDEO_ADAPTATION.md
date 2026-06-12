@@ -59,9 +59,12 @@ start_session
 -> close_session
 ```
 
-Each selected polygon is validated with Shapely and converted to an interior
-`representative_point()`. That point becomes an absolute positive visual
-prompt with a temporary per-run SAM object ID.
+Each selected polygon is validated with Shapely and rasterized into a binary
+source mask. Interior foreground points and a ring of background points are
+derived from that exact mask, normalized to the frame, and sent through SAM
+3's supported visual-point prompt API. This keeps the prompt anchored to the
+large droplet the user selected instead of asking SAM 3 to choose among nearby
+bright welding regions.
 
 ### Stable source identity
 
@@ -89,6 +92,18 @@ the annotator's existing flattened polygon schema:
 
 Using the existing schema preserves rendering, project saving, COCO export,
 and YOLO segmentation export.
+
+Before conversion, only the largest connected mask component is retained.
+Disconnected small components are treated as spatter and are never saved as
+additional droplets. The largest component is also rejected if it is smaller
+than 15% of the manually selected source droplet or fewer than 50 pixels.
+Masks that grow implausibly large compared with the source polygon or video
+frame are rejected as tracking drift.
+
+The prompt-frame result must overlap the manually selected source polygon. If
+it does not, propagation stops immediately and the UI reports that no tracking
+annotations were saved. This prevents a plausible-sized but unrelated bright
+feature from being mislabeled as the selected droplet.
 
 ### Threading and lifecycle safety
 
@@ -118,9 +133,12 @@ model objects to CPU, runs garbage collection, and clears the CUDA allocator.
 4. Initialize SAM 3 with **Load Video Frames to SAM 3**.
 5. Select an annotation and choose **Track Selected Forward**, or track all
    valid polygons on the current frame.
-6. The application converts source polygons to positive point prompts.
+6. The application converts each source polygon into normalized foreground and
+   background point prompts.
 7. SAM 3 propagates object masks through later frames.
-8. Worker-side contour conversion produces compact polygons.
+8. Worker-side filtering retains only a droplet-sized main component, rejects
+   small spatter and implausible drift, then contour conversion produces one
+   compact polygon per tracked droplet.
 9. The application maps polygons back to filenames/classes and autosaves.
 
 The prompt frame is not overwritten. Repeating the same source-frame/source-ID
@@ -130,15 +148,16 @@ run replaces its prior generated annotations rather than appending duplicates.
 
 Automated and integration verification completed during implementation:
 
-- Full pytest suite: 78 tests passed.
+- Full pytest suite: 90 tests passed after the tracking/filtering changes.
+- Focused SAM 3 tracker suite: 15 tests passed after the source-overlap gate.
 - Python `compileall` passed.
-- `git diff --check` passed.
-- Offscreen `ImageAnnotator` construction passed.
 - The real local SAM 3 checkpoint loaded on an NVIDIA RTX 3060 Laptop GPU.
 - A real 99-frame welding directory initialized successfully.
-- A point prompt propagated through frames 97 and 98.
-- Returned masks converted into polygon segmentations.
-- Final senior review reported no remaining P0 or P1 findings.
+- Prompt experiments confirmed that unnormalized image coordinates and
+  ambiguous single-point prompts are unsuitable for these welding frames.
+- A real large-droplet polygon on `001154.jpg` caused SAM 3 to select a
+  different bright feature. The source-overlap gate rejected it on the first
+  frame and saved zero false droplet/spatter annotations.
 
 ## Manual Validation Still Required
 
@@ -155,9 +174,12 @@ motion, or substantial shape changes.
 
 > I adapted an existing PyQt6 image annotator for welding-video frames and
 > integrated Meta's official SAM 3 session predictor. Existing labeled
-> polygons become interior point prompts, SAM 3 propagates masks forward, and
-> the masks are converted back into the application's polygon format. The main
-> integration risks were frame-index correctness, persistent source identity,
-> GUI reentrancy, project lifecycle safety, and Windows GPU compatibility.
-> Automated and GPU smoke tests pass; the remaining task is a human-reviewed
-> tracking-quality evaluation on representative welding data.
+> polygons become normalized foreground/background point prompts, SAM 3
+> propagates masks forward, and the masks are converted back into the
+> application's polygon format. To match our annotation criteria, I added
+> connected-component and relative-area filtering so small spatter is not
+> counted as a droplet. The main integration risks were frame-index
+> correctness, persistent source identity, GUI reentrancy, project lifecycle
+> safety, and Windows GPU compatibility. Automated and GPU smoke tests pass;
+> the remaining task is a human-reviewed tracking-quality evaluation on
+> representative welding data.
