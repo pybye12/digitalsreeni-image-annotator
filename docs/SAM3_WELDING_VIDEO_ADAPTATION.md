@@ -62,9 +62,16 @@ start_session
 Each selected polygon is validated with Shapely and rasterized into a binary
 source mask. Interior foreground points and a ring of background points are
 derived from that exact mask, normalized to the frame, and sent through SAM
-3's supported visual-point prompt API. This keeps the prompt anchored to the
-large droplet the user selected instead of asking SAM 3 to choose among nearby
-bright welding regions.
+3's supported visual-point prompt API. When the installed official Meta SAM 3
+build exposes its underlying tracker mask-prompt capability, the adapter then
+replaces the approximate point result with the exact source polygon mask before
+propagation. This keeps the track anchored to the large droplet the user
+selected instead of asking SAM 3 to choose among nearby bright welding regions.
+
+The public session request layer does not currently expose mask prompts, so
+mask seeding is feature-detected against the official model object. Builds
+without that capability retain the point prompt and source-overlap rejection
+fallback instead of failing at startup.
 
 ### Stable source identity
 
@@ -134,7 +141,8 @@ model objects to CPU, runs garbage collection, and clears the CUDA allocator.
 5. Select an annotation and choose **Track Selected Forward**, or track all
    valid polygons on the current frame.
 6. The application converts each source polygon into normalized foreground and
-   background point prompts.
+   background point prompts, then uses the exact polygon as a tracker mask seed
+   when supported by the installed official SAM 3 build.
 7. SAM 3 propagates object masks through later frames.
 8. Worker-side filtering retains only a droplet-sized main component, rejects
    small spatter and implausible drift, then contour conversion produces one
@@ -148,8 +156,8 @@ run replaces its prior generated annotations rather than appending duplicates.
 
 Automated and integration verification completed during implementation:
 
-- Full pytest suite: 90 tests passed after the tracking/filtering changes.
-- Focused SAM 3 tracker suite: 15 tests passed after the source-overlap gate.
+- Full pytest suite: 91 tests passed after the tracking/filtering changes.
+- Focused SAM 3 tracker suite: 16 tests passed after the source-overlap gate.
 - Python `compileall` passed.
 - The real local SAM 3 checkpoint loaded on an NVIDIA RTX 3060 Laptop GPU.
 - A real 99-frame welding directory initialized successfully.
@@ -158,6 +166,9 @@ Automated and integration verification completed during implementation:
 - A real large-droplet polygon on `001154.jpg` caused SAM 3 to select a
   different bright feature. The source-overlap gate rejected it on the first
   frame and saved zero false droplet/spatter annotations.
+- Exact polygon mask seeding was then validated on the same source droplet
+  across 11 frames. The accepted main-component areas ranged from about 1,238
+  to 2,020 pixels, while disconnected small spatter was excluded.
 
 ## Manual Validation Still Required
 
