@@ -68,6 +68,18 @@ class OffTargetPredictor(FakePredictor):
             }
 
 
+class FakeMaskSeedTracker:
+    def __init__(self):
+        self.added_masks = []
+        self.preflight_states = []
+
+    def add_new_mask(self, state, frame_idx, object_id, mask):
+        self.added_masks.append((state, frame_idx, object_id, mask))
+
+    def propagate_in_video_preflight(self, state, run_mem_encoder):
+        self.preflight_states.append((state, run_mem_encoder))
+
+
 def test_tracker_uses_supported_session_and_point_prompt_api(tmp_path):
     predictor = FakePredictor()
     tracker = SAM3Tracker("unused.pt", predictor=predictor)
@@ -157,6 +169,34 @@ def test_tracker_uses_source_polygon_as_normalized_prompt(tmp_path):
     assert prompt["point_labels"].count(0) == 8
     assert all(0 <= coordinate <= 1 for point in prompt["points"] for coordinate in point)
     assert set(results[0][1]) == {7}
+
+
+def test_tracker_uses_exact_polygon_mask_when_meta_api_is_available(tmp_path):
+    predictor = FakePredictor()
+    mask_seed_tracker = FakeMaskSeedTracker()
+    predictor.model = SimpleNamespace(
+        tracker=mask_seed_tracker,
+        _get_tracker_inference_states_by_obj_ids=lambda state, object_ids: [
+            "tracker-state"
+        ],
+    )
+    predictor._all_inference_states = {
+        "session-1": {"state": "session-state"},
+    }
+    tracker = SAM3Tracker("unused.pt", predictor=predictor)
+    tracker.init_state(str(tmp_path))
+
+    tracker.track_polygons(
+        2,
+        [(7, [2, 2, 12, 2, 12, 12, 2, 12])],
+        (20, 20),
+    )
+
+    _, frame_idx, object_id, mask = mask_seed_tracker.added_masks[0]
+    assert frame_idx == 2
+    assert object_id == 7
+    assert np.count_nonzero(mask.numpy()) > 0
+    assert mask_seed_tracker.preflight_states == [("tracker-state", True)]
 
 
 def test_match_output_objects_to_boxes_uses_mask_overlap():
