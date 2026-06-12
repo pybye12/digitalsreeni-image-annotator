@@ -61,7 +61,7 @@ from shapely.ops import unary_union
 from shapely.validation import make_valid
 from tifffile import TiffFile
 
-from .annotation_statistics import show_annotation_statistics
+from .annotation_statistics import show_annotation_statistics, summarize_annotations
 from .coco_json_combiner import show_coco_json_combiner
 from .dino_phrase_editor import ClassThresholdTable, PhraseEditorPanel
 from .dino_utils import DINOUtils
@@ -6152,6 +6152,7 @@ class ImageAnnotator(QMainWindow):
                 "sam3_source_frame",
                 "sam3_source_id",
                 "sam3_object_id",
+                "droplet_event_id",
             ):
                 annotation.pop(key, None)
             self.all_annotations.setdefault(next_image_name, {}).setdefault(
@@ -6254,6 +6255,8 @@ class ImageAnnotator(QMainWindow):
             if not isinstance(polygon, Polygon):
                 continue
             source_id = annotation.setdefault("sam3_source_id", uuid.uuid4().hex)
+            if class_name == "droplet":
+                annotation["droplet_event_id"] = source_id
             polygon_points = np.asarray(polygon.exterior.coords[:-1]).reshape(-1, 2)
             object_polygons.append((object_id, polygon_points.flatten().tolist()))
             objects_to_track[object_id] = (class_name, source_id)
@@ -6307,6 +6310,11 @@ class ImageAnnotator(QMainWindow):
                                 "sam3_source_frame": current_image_name,
                                 "sam3_source_id": source_id,
                                 "sam3_object_id": object_id,
+                                **(
+                                    {"droplet_event_id": source_id}
+                                    if class_name == "droplet"
+                                    else {}
+                                ),
                             }
                         )
                         tracked_annotation_count += 1
@@ -6316,6 +6324,17 @@ class ImageAnnotator(QMainWindow):
             self.image_label.update()
             if tracked_annotation_count:
                 next_name = self.frame_sequence.name_for_index(current_idx + 1)
+                if any(
+                    class_name == "droplet"
+                    for class_name, _ in objects_to_track.values()
+                ):
+                    droplet_count = summarize_annotations(self.all_annotations)[
+                        "unique_droplet_events"
+                    ]
+                    self.show_info(
+                        "SAM 3 Tracking",
+                        f"Unique large-droplet count: {droplet_count}",
+                    )
             else:
                 self.show_warning(
                     "SAM 3 Tracking",

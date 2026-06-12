@@ -6,6 +6,43 @@ import tempfile
 import os
 import webbrowser
 
+
+def summarize_annotations(annotations):
+    """Summarize frame annotations and unique tracked droplet events."""
+    class_distribution = {}
+    objects_per_image = {}
+    total_objects = 0
+    droplet_event_ids = set()
+    droplet_frame_annotations = 0
+
+    for image, image_annotations in annotations.items():
+        objects_in_image = 0
+        for class_name, class_annotations in image_annotations.items():
+            class_count = len(class_annotations)
+            class_distribution[class_name] = (
+                class_distribution.get(class_name, 0) + class_count
+            )
+            objects_in_image += class_count
+            total_objects += class_count
+            if class_name == "droplet":
+                droplet_frame_annotations += class_count
+                for annotation in class_annotations:
+                    event_id = annotation.get("droplet_event_id") or annotation.get(
+                        "sam3_source_id"
+                    )
+                    if event_id:
+                        droplet_event_ids.add(event_id)
+        objects_per_image[image] = objects_in_image
+
+    return {
+        "class_distribution": class_distribution,
+        "objects_per_image": objects_per_image,
+        "total_objects": total_objects,
+        "droplet_frame_annotations": droplet_frame_annotations,
+        "unique_droplet_events": len(droplet_event_ids),
+    }
+
+
 class AnnotationStatisticsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -36,19 +73,10 @@ class AnnotationStatisticsDialog(QDialog):
 
     def generate_statistics(self, annotations):
         try:
-            # Class distribution
-            class_distribution = {}
-            objects_per_image = {}
-            total_objects = 0
-    
-            for image, image_annotations in annotations.items():
-                objects_in_image = 0
-                for class_name, class_annotations in image_annotations.items():
-                    class_count = len(class_annotations)
-                    class_distribution[class_name] = class_distribution.get(class_name, 0) + class_count
-                    objects_in_image += class_count
-                    total_objects += class_count
-                objects_per_image[image] = objects_in_image
+            summary = summarize_annotations(annotations)
+            class_distribution = summary["class_distribution"]
+            objects_per_image = summary["objects_per_image"]
+            total_objects = summary["total_objects"]
     
             avg_objects_per_image = total_objects / len(annotations) if annotations else 0
     
@@ -85,6 +113,14 @@ class AnnotationStatisticsDialog(QDialog):
             # Display statistics in the text browser
             stats_text = f"Total objects: {total_objects}\n"
             stats_text += f"Average objects per image: {avg_objects_per_image:.2f}\n\n"
+            stats_text += (
+                f"Unique tracked droplet events: "
+                f"{summary['unique_droplet_events']}\n"
+            )
+            stats_text += (
+                f"Droplet frame annotations: "
+                f"{summary['droplet_frame_annotations']}\n\n"
+            )
             stats_text += "Class distribution:\n"
             for class_name, count in class_distribution.items():
                 stats_text += f"  {class_name}: {count}\n"

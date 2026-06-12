@@ -20,6 +20,7 @@ class SAM3Tracker:
 
     MIN_TRACKED_AREA = 50.0
     MIN_SOURCE_AREA_RATIO = 0.15
+    MAX_CONSECUTIVE_MISSES = 2
 
     def __init__(self, checkpoint_path, predictor=None):
         self.checkpoint_path = checkpoint_path
@@ -321,15 +322,18 @@ class SAM3Tracker:
         }
         results = []
         active_object_ids = set(source_areas)
+        consecutive_misses = {object_id: 0 for object_id in source_areas}
         for response in self.predictor.handle_stream_request(request):
             segmentations_by_object = {}
-            for object_id, mask in self.extract_masks_from_outputs(
-                response["outputs"]
-            ).items():
-                if object_id not in active_object_ids:
-                    continue
-                segmentation = self.largest_plausible_segmentation(
-                    mask, source_areas[object_id], frame_area
+            masks_by_object = self.extract_masks_from_outputs(response["outputs"])
+            for object_id in list(active_object_ids):
+                mask = masks_by_object.get(object_id)
+                segmentation = (
+                    self.largest_plausible_segmentation(
+                        mask, source_areas[object_id], frame_area
+                    )
+                    if mask is not None
+                    else None
                 )
                 if response["frame_index"] == frame_idx and (
                     not segmentation
@@ -341,9 +345,17 @@ class SAM3Tracker:
                     active_object_ids.discard(object_id)
                     continue
                 if segmentation:
+                    consecutive_misses[object_id] = 0
                     segmentations_by_object[object_id] = [segmentation]
+                else:
+                    consecutive_misses[object_id] += 1
+                    if (
+                        consecutive_misses[object_id]
+                        >= self.MAX_CONSECUTIVE_MISSES
+                    ):
+                        active_object_ids.discard(object_id)
             results.append((response["frame_index"], segmentations_by_object))
-            if response["frame_index"] == frame_idx and not active_object_ids:
+            if not active_object_ids:
                 break
         return results
 
