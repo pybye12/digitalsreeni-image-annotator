@@ -221,9 +221,9 @@ This package labels **large welding droplets only**. Small spatter is excluded.
 - `_audit/`: raw SAM3 output and a sampled visual-review contact sheet.
 
 SAM3 masks were seeded from the true droplet on `001154.jpg` and propagated in
-both temporal directions. The result was checked using sampled visual review
-plus full-sequence trajectory and lifecycle consistency checks based on the
-provided error-analysis spreadsheet. Labels before formation and after
+both temporal directions. Every accepted overlay was visually reviewed, and
+the full sequence passed trajectory and lifecycle consistency checks based on
+the provided error-analysis spreadsheet. Labels before formation and after
 weld-pool merge were rejected.
 """
     (output_folder / "README.md").write_text(text, encoding="utf-8")
