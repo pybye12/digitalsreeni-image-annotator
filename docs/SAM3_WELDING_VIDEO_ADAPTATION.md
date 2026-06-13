@@ -196,17 +196,3 @@ bright region, or loses the object.
 The current verification proves integration compatibility and execution. It
 does not establish segmentation accuracy across glare, occlusion, rapid
 motion, or substantial shape changes.
-
-## Suggested Mentor Summary
-
-> I adapted an existing PyQt6 image annotator for welding-video frames and
-> integrated Meta's official SAM 3 session predictor. Existing labeled
-> polygons become normalized foreground/background point prompts, SAM 3
-> propagates masks forward, and the masks are converted back into the
-> application's polygon format. To match our annotation criteria, I added
-> connected-component and relative-area filtering so small spatter is not
-> counted as a droplet. The main integration risks were frame-index
-> correctness, persistent source identity, GUI reentrancy, project lifecycle
-> safety, and Windows GPU compatibility. Automated and GPU smoke tests pass;
-> the remaining task is a human-reviewed tracking-quality evaluation on
-> representative welding data.
