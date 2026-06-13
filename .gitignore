@@ -14,6 +14,11 @@ models/
 .claude/*
 !.claude/agents/
 .venv
+.uv-cache/
+.uv-python/
+
+# Generated annotation exports
+outputs/
 
 # Python cache and build artifacts
 __pycache__/
