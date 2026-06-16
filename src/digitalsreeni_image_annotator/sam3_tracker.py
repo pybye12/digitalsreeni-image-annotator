@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
+from contextlib import nullcontext
 
 import cv2
 import numpy as np
@@ -61,6 +62,23 @@ class SAM3Tracker:
             ) from exc
 
     @staticmethod
+    def _cuda_autocast_context():
+        """Keep SAM 3 CUDA ops in one dtype during GUI-driven inference.
+
+        Some official SAM 3 builds run activations in bfloat16 on CUDA. Without
+        an explicit autocast context, PyTorch can hit mixed bfloat16/float32
+        convolution inputs during interactive prompts.
+        """
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return torch.autocast("cuda", dtype=torch.bfloat16)
+        except Exception:
+            pass
+        return nullcontext()
+
+    @staticmethod
     def _configure_connected_components_fallback():
         """Use Meta's CPU implementation when CUDA CC backends are unavailable.
 
@@ -91,13 +109,14 @@ class SAM3Tracker:
             raise RuntimeError("SAM 3 predictor is not loaded.")
 
         self.close_session()
-        response = self.predictor.handle_request(
-            {
-                "type": "start_session",
-                "resource_path": video_folder_path,
-                "offload_video_to_cpu": True,
-            }
-        )
+        with self._cuda_autocast_context():
+            response = self.predictor.handle_request(
+                {
+                    "type": "start_session",
+                    "resource_path": video_folder_path,
+                    "offload_video_to_cpu": True,
+                }
+            )
         self.session_id = response["session_id"]
         return self.session_id
 
@@ -118,46 +137,47 @@ class SAM3Tracker:
         if not self.is_initialized:
             raise RuntimeError("Call init_state before tracking.")
 
-        self.predictor.handle_request(
-            {"type": "reset_session", "session_id": self.session_id}
-        )
-        for object_id, point in object_points:
-            prompt_point = list(point)
-            rel_coordinates = False
-            if frame_size is not None:
-                frame_width, frame_height = frame_size
-                prompt_point = [
-                    float(point[0]) / frame_width,
-                    float(point[1]) / frame_height,
-                ]
-                rel_coordinates = True
+        with self._cuda_autocast_context():
             self.predictor.handle_request(
-                {
-                    "type": "add_prompt",
-                    "session_id": self.session_id,
-                    "frame_index": frame_idx,
-                    "obj_id": object_id,
-                    "points": [prompt_point],
-                    "point_labels": [1],
-                    "rel_coordinates": rel_coordinates,
-                }
+                {"type": "reset_session", "session_id": self.session_id}
             )
+            for object_id, point in object_points:
+                prompt_point = list(point)
+                rel_coordinates = False
+                if frame_size is not None:
+                    frame_width, frame_height = frame_size
+                    prompt_point = [
+                        float(point[0]) / frame_width,
+                        float(point[1]) / frame_height,
+                    ]
+                    rel_coordinates = True
+                self.predictor.handle_request(
+                    {
+                        "type": "add_prompt",
+                        "session_id": self.session_id,
+                        "frame_index": frame_idx,
+                        "obj_id": object_id,
+                        "points": [prompt_point],
+                        "point_labels": [1],
+                        "rel_coordinates": rel_coordinates,
+                    }
+                )
 
-        request = {
-            "type": "propagate_in_video",
-            "session_id": self.session_id,
-            "propagation_direction": "forward",
-            "start_frame_index": frame_idx,
-        }
-        results = []
-        for response in self.predictor.handle_stream_request(request):
-            segmentations_by_object = {
-                object_id: self.mask_to_segmentations(mask)
-                for object_id, mask in self.extract_masks_from_outputs(
-                    response["outputs"]
-                ).items()
+            request = {
+                "type": "propagate_in_video",
+                "session_id": self.session_id,
+                "propagation_direction": "forward",
+                "start_frame_index": frame_idx,
             }
-            results.append((response["frame_index"], segmentations_by_object))
+            results = []
+            for response in self.predictor.handle_stream_request(request):
+                segmentations_by_object = {
+                    object_id: self.mask_to_segmentations(mask)
+                    for object_id, mask in self.extract_masks_from_outputs(
+                        response["outputs"]
+                    ).items()
+                }
+                results.append((response["frame_index"], segmentations_by_object))
         return results
 
     def track_boxes(self, frame_idx, object_boxes, frame_size):
@@ -193,18 +213,19 @@ class SAM3Tracker:
         if not requested_boxes:
             raise ValueError("No valid object boxes supplied.")
 
-        self.predictor.handle_request(
-            {"type": "reset_session", "session_id": self.session_id}
-        )
-        prompt_response = self.predictor.handle_request(
-            {
-                "type": "add_prompt",
-                "session_id": self.session_id,
-                "frame_index": frame_idx,
-                "bounding_boxes": normalized_boxes,
-                "bounding_box_labels": [1] * len(normalized_boxes),
-            }
-        )
+        with self._cuda_autocast_context():
+            self.predictor.handle_request(
+                {"type": "reset_session", "session_id": self.session_id}
+            )
+            prompt_response = self.predictor.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": self.session_id,
+                    "frame_index": frame_idx,
+                    "bounding_boxes": normalized_boxes,
+                    "bounding_box_labels": [1] * len(normalized_boxes),
+                }
+            )
         model_to_requested = self.match_output_objects_to_boxes(
             prompt_response.get("outputs", {}), requested_boxes
         )
@@ -218,22 +239,23 @@ class SAM3Tracker:
             ).items()
             if model_id in model_to_requested
         }
-        self.predictor.handle_request(
-            {"type": "reset_session", "session_id": self.session_id}
-        )
-        for requested_id, mask in matched_masks.items():
-            points, labels = self.mask_to_refinement_points(mask, frame_size)
+        with self._cuda_autocast_context():
             self.predictor.handle_request(
-                {
-                    "type": "add_prompt",
-                    "session_id": self.session_id,
-                    "frame_index": frame_idx,
-                    "obj_id": requested_id,
-                    "points": points,
-                    "point_labels": labels,
-                    "rel_coordinates": True,
-                }
+                {"type": "reset_session", "session_id": self.session_id}
             )
+            for requested_id, mask in matched_masks.items():
+                points, labels = self.mask_to_refinement_points(mask, frame_size)
+                self.predictor.handle_request(
+                    {
+                        "type": "add_prompt",
+                        "session_id": self.session_id,
+                        "frame_index": frame_idx,
+                        "obj_id": requested_id,
+                        "points": points,
+                        "point_labels": labels,
+                        "rel_coordinates": True,
+                    }
+                )
 
         source_areas = {
             object_id: width * height
@@ -247,20 +269,21 @@ class SAM3Tracker:
             "start_frame_index": frame_idx,
         }
         results = []
-        for response in self.predictor.handle_stream_request(request):
-            segmentations_by_object = {}
-            for model_id, mask in self.extract_masks_from_outputs(
-                response["outputs"]
-            ).items():
-                requested_id = int(model_id)
-                if requested_id not in source_areas:
-                    continue
-                segmentation = self.largest_plausible_segmentation(
-                    mask, source_areas[requested_id], frame_area
-                )
-                if segmentation:
-                    segmentations_by_object[requested_id] = [segmentation]
-            results.append((response["frame_index"], segmentations_by_object))
+        with self._cuda_autocast_context():
+            for response in self.predictor.handle_stream_request(request):
+                segmentations_by_object = {}
+                for model_id, mask in self.extract_masks_from_outputs(
+                    response["outputs"]
+                ).items():
+                    requested_id = int(model_id)
+                    if requested_id not in source_areas:
+                        continue
+                    segmentation = self.largest_plausible_segmentation(
+                        mask, source_areas[requested_id], frame_area
+                    )
+                    if segmentation:
+                        segmentations_by_object[requested_id] = [segmentation]
+                results.append((response["frame_index"], segmentations_by_object))
         return results
 
     def track_polygons(self, frame_idx, object_polygons, frame_size):
@@ -294,69 +317,70 @@ class SAM3Tracker:
         if not prompts:
             raise ValueError("No valid large-droplet polygons supplied.")
 
-        self.predictor.handle_request(
-            {"type": "reset_session", "session_id": self.session_id}
-        )
-        for object_id, points, labels in prompts:
+        with self._cuda_autocast_context():
             self.predictor.handle_request(
-                {
-                    "type": "add_prompt",
-                    "session_id": self.session_id,
-                    "frame_index": frame_idx,
-                    "obj_id": object_id,
-                    "points": points,
-                    "point_labels": labels,
-                    "rel_coordinates": True,
-                }
+                {"type": "reset_session", "session_id": self.session_id}
             )
-            self._replace_tracker_prompt_with_mask(
-                frame_idx, object_id, source_masks[object_id]
-            )
-
-        frame_area = frame_width * frame_height
-        request = {
-            "type": "propagate_in_video",
-            "session_id": self.session_id,
-            "propagation_direction": "forward",
-            "start_frame_index": frame_idx,
-        }
-        results = []
-        active_object_ids = set(source_areas)
-        consecutive_misses = {object_id: 0 for object_id in source_areas}
-        for response in self.predictor.handle_stream_request(request):
-            segmentations_by_object = {}
-            masks_by_object = self.extract_masks_from_outputs(response["outputs"])
-            for object_id in list(active_object_ids):
-                mask = masks_by_object.get(object_id)
-                segmentation = (
-                    self.largest_plausible_segmentation(
-                        mask, source_areas[object_id], frame_area
-                    )
-                    if mask is not None
-                    else None
+            for object_id, points, labels in prompts:
+                self.predictor.handle_request(
+                    {
+                        "type": "add_prompt",
+                        "session_id": self.session_id,
+                        "frame_index": frame_idx,
+                        "obj_id": object_id,
+                        "points": points,
+                        "point_labels": labels,
+                        "rel_coordinates": True,
+                    }
                 )
-                if response["frame_index"] == frame_idx and (
-                    not segmentation
-                    or self.segmentation_overlap_ratio(
-                        segmentation, source_masks[object_id]
+                self._replace_tracker_prompt_with_mask(
+                    frame_idx, object_id, source_masks[object_id]
+                )
+
+            frame_area = frame_width * frame_height
+            request = {
+                "type": "propagate_in_video",
+                "session_id": self.session_id,
+                "propagation_direction": "forward",
+                "start_frame_index": frame_idx,
+            }
+            results = []
+            active_object_ids = set(source_areas)
+            consecutive_misses = {object_id: 0 for object_id in source_areas}
+            for response in self.predictor.handle_stream_request(request):
+                segmentations_by_object = {}
+                masks_by_object = self.extract_masks_from_outputs(response["outputs"])
+                for object_id in list(active_object_ids):
+                    mask = masks_by_object.get(object_id)
+                    segmentation = (
+                        self.largest_plausible_segmentation(
+                            mask, source_areas[object_id], frame_area
+                        )
+                        if mask is not None
+                        else None
                     )
-                    < 0.1
-                ):
-                    active_object_ids.discard(object_id)
-                    continue
-                if segmentation:
-                    consecutive_misses[object_id] = 0
-                    segmentations_by_object[object_id] = [segmentation]
-                else:
-                    consecutive_misses[object_id] += 1
-                    if (
-                        consecutive_misses[object_id]
-                        >= self.MAX_CONSECUTIVE_MISSES
+                    if response["frame_index"] == frame_idx and (
+                        not segmentation
+                        or self.segmentation_overlap_ratio(
+                            segmentation, source_masks[object_id]
+                        )
+                        < 0.1
                     ):
                         active_object_ids.discard(object_id)
-            results.append((response["frame_index"], segmentations_by_object))
-            if not active_object_ids:
-                break
+                        continue
+                    if segmentation:
+                        consecutive_misses[object_id] = 0
+                        segmentations_by_object[object_id] = [segmentation]
+                    else:
+                        consecutive_misses[object_id] += 1
+                        if (
+                            consecutive_misses[object_id]
+                            >= self.MAX_CONSECUTIVE_MISSES
+                        ):
+                            active_object_ids.discard(object_id)
+                results.append((response["frame_index"], segmentations_by_object))
+                if not active_object_ids:
+                    break
         return results
 
     def _replace_tracker_prompt_with_mask(self, frame_idx, object_id, source_mask):
@@ -392,8 +416,9 @@ class SAM3Tracker:
             import torch
 
             mask_tensor = torch.as_tensor(source_mask, dtype=torch.bool)
-            add_new_mask(tracker_states[0], frame_idx, object_id, mask_tensor)
-            preflight(tracker_states[0], run_mem_encoder=True)
+            with self._cuda_autocast_context():
+                add_new_mask(tracker_states[0], frame_idx, object_id, mask_tensor)
+                preflight(tracker_states[0], run_mem_encoder=True)
             return True
         except Exception as exc:
             print(f"[SAM3] exact polygon mask seed unavailable: {exc}")
