@@ -39,6 +39,7 @@ Dr. Sreenivas Bhattiprolu
 - Change the application font size on the fly — Make your annotations as big or small as your caffeine level requires.
 - Dark mode for those late-night annotation marathons — Who needs sleep when you have dark mode?
 - Pick appropriate pre-trained SAM2 model for flexible and improved semi-automated annotations.
+- Track user-labeled objects forward through extracted video frames with the optional SAM 3 integration.
 - Change the class of an annotation to a different class.
 - Turn visibility of a class ON and OFF.
 - YOLO (beta) training using current annotations and loading trained model to segment images.
@@ -189,6 +190,89 @@ You should see `True` and your GPU name. For other platforms or driver combinati
    - Enter: Finish current annotation, exit edit mode, or accept SAM-generated mask
    - Up/Down Arrow Keys: Navigate through slices in multi-dimensional images
    - - and =: Adjust pen size for paint brush and eraser tools
+
+## SAM 3 Welding Video Tracking
+
+This fork adds an optional SAM 3 workflow for propagating a manually labeled
+object through extracted video frames. SAM 3 does not decide whether a region
+is an `internal_arc`, `external_arc`, `droplet`, or `molten_consumable`. The
+user chooses the class and draws the starting polygon; SAM 3 then attempts to
+follow that same visual region in later frames.
+
+### Install and launch on Windows with Git Bash
+
+Run these commands from Git Bash. Python 3.11 is recommended for the current
+SAM 3 environment.
+
+```bash
+git clone https://github.com/pybye12/digitalsreeni-image-annotator.git
+cd digitalsreeni-image-annotator
+
+py -3.11 -m venv .venv
+source .venv/Scripts/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
+
+python -m digitalsreeni_image_annotator.main
+```
+
+Video tracking also requires [Meta's official SAM 3 package](https://github.com/facebookresearch/sam3)
+installed in the same virtual environment, a compatible SAM 3 checkpoint, and
+a CUDA-capable NVIDIA GPU. Put the checkpoint at
+`sam3-001.pt` in the repository root, or select the `.pt`/`.pth` file when the
+application asks for it. The regular manual tools and SAM 2 features do not
+require this checkpoint.
+
+### Track an annotation forward
+
+1. Select **Video > Open Frame Folder...** and choose one folder containing a
+   numerically named image sequence.
+2. Select **Welding > Add Default Welding Classes**.
+3. Choose the class you want to label.
+4. Use **Polygon** to outline the object on a clear starting frame, then press
+   **Enter** to finish the polygon.
+5. Click the finished polygon's row in the **Annotations** panel. Selecting the
+   class or clicking only on the canvas is not enough.
+6. Click **Load Video Frames to SAM 3** and wait for the success message.
+7. Click **Track Selected Forward**. Use **Track All Objects** only when every
+   polygon on the current frame should be propagated.
+8. Move through the image list and review the generated masks. Correct errors
+   with **Polygon**, **Paint Brush**, and **Eraser**.
+9. Save the `.iap` project, then choose an export format and click
+   **Export Annotations** when the reviewed labels are ready to share.
+
+If the application reports **No valid polygon annotations selected**, return
+to step 5 and select the polygon in the Annotations panel. Only annotations
+containing a valid segmentation polygon can be tracked; a rectangle alone is
+not a tracking prompt.
+
+### Validate internal and external arc tracking
+
+Do not conclude that arc tracking works or fails from setup problems or a
+single frame. Use the same controlled check for both `internal_arc` and
+`external_arc`:
+
+1. Choose a continuous sequence where the arc boundary is visible for at least
+   20 frames.
+2. Draw a careful source polygon on a clear frame and track it forward.
+3. Review the source frame, early frames, the middle of the sequence, and the
+   final frames. Record the first frame where the mask leaves the intended arc,
+   follows glare or a reflection, merges with another bright region, or loses
+   a meaningful part of the boundary.
+4. Repeat on at least three different sequences for each arc class. Include
+   stable footage and difficult examples with glare or shape changes.
+5. Save the project and record a short screen capture showing the source
+   polygon, propagated masks, frame names, corrections, and export result.
+
+A successful run proves that the integration can propagate an arc prompt. It
+does not by itself prove segmentation accuracy. Arc suitability should be
+decided from the reviewed sequences and the agreed labeling protocol. If SAM 3
+drifts, the manual drawing tools remain available for producing ground-truth
+arc labels.
+
+For implementation details, limitations, and completed engineering checks, see
+[SAM 3 Welding Video Annotator Adaptation](docs/SAM3_WELDING_VIDEO_ADAPTATION.md).
 
 ## Known Issues and Bug Fixes
 
