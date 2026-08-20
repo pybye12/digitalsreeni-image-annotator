@@ -20,6 +20,8 @@ uploaded by the application.
 - Save work as an `.iap` project and continue later.
 - Export COCO, YOLO segmentation, Pascal VOC, class-ID masks, or RGB masks.
 - Keep custom classes for general datasets or apply the included ER70S-6 presets.
+- Keep everyday labeling tools separate from optional models with Labeling and
+  AI Assist tabs.
 
 ## What This Fork Adds
 
@@ -126,9 +128,10 @@ checkpoint when prompted. Then:
 
 1. Draw a polygon on a clear starting frame.
 2. Click that polygon in the **Annotations** list.
-3. Click **Load Video Frames to SAM 3**.
-4. Click **Track Selected Forward**.
-5. Review all generated masks and fix drift with the manual tools.
+3. Open the **AI Assist** tab.
+4. Click **Load Video Frames to SAM 3**.
+5. Click **Track Selected Forward**.
+6. Review all generated masks and fix drift with the manual tools.
 
 If the app reports **No valid polygon annotations selected**, select the
 finished polygon row in the Annotations panel before tracking.

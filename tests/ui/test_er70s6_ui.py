@@ -1,3 +1,4 @@
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QColor
 
 from digitalsreeni_image_annotator.annotator_window import ImageAnnotator
@@ -30,3 +31,40 @@ def test_er70s6_controls_and_presets_are_available(qtbot):
         128,
         0,
     )
+
+
+def test_sidebar_separates_labeling_from_optional_ai_tools(qtbot):
+    window = ImageAnnotator()
+    qtbot.addWidget(window)
+    window.hide()
+
+    assert window.sidebar_tabs.count() == 2
+    assert window.sidebar_tabs.tabText(0) == "Labeling"
+    assert window.sidebar_tabs.tabText(1) == "AI Assist"
+    assert window.labeling_page.isAncestorOf(window.polygon_button)
+    assert window.labeling_page.isAncestorOf(window.annotation_list)
+    assert window.labeling_page.isAncestorOf(window.export_button)
+    assert window.ai_page.isAncestorOf(window.sam_box_button)
+    assert window.ai_page.isAncestorOf(window.sam3_init_btn)
+    assert window.ai_page.isAncestorOf(window.dino_model_selector)
+    assert (
+        window.labeling_scroll.horizontalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+    assert (
+        window.ai_scroll.horizontalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+
+
+def test_sidebar_exposes_common_loading_and_welding_actions(qtbot):
+    window = ImageAnnotator()
+    qtbot.addWidget(window)
+    window.hide()
+
+    assert window.open_video_button.text() == "Open Video Clip..."
+    assert window.cavitar_preset_button.text() == "CAVITAR Preset"
+    assert window.full_arc_preset_button.text() == "Full Arc Preset"
+    assert window.add_class_button.text() == "Add Custom Class"
+    assert window.class_list.maximumHeight() == 120
+    assert window.annotation_list.maximumHeight() == 150

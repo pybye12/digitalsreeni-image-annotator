@@ -56,6 +56,52 @@ QLabel.section-header {
     color: #333333;  /* Dark color for visibility in light mode */
 }
 
+QLabel.help-text {
+    color: #666666;
+    font-size: 11px;
+}
+
+QLabel.workflow-hint {
+    background-color: #E8EEF5;
+    border: 1px solid #C2CFDC;
+    border-radius: 4px;
+    padding: 8px;
+    color: #263746;
+    font-weight: bold;
+}
+
+QGroupBox {
+    border: 1px solid #C8C8C8;
+    border-radius: 5px;
+    margin-top: 10px;
+    padding-top: 8px;
+    font-weight: bold;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 9px;
+    padding: 0 4px;
+    color: #333333;
+}
+
+QTabWidget::pane {
+    border: 1px solid #C8C8C8;
+    border-radius: 4px;
+}
+
+QTabBar::tab {
+    background-color: #E4E4E4;
+    border: 1px solid #C8C8C8;
+    padding: 7px 14px;
+    min-width: 90px;
+}
+
+QTabBar::tab:selected {
+    background-color: #FFFFFF;
+    color: #222222;
+}
+
 
 QLineEdit, QTextEdit, QPlainTextEdit {
     background-color: #FFFFFF;

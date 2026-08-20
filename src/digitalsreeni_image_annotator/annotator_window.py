@@ -46,6 +46,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -60,9 +61,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
-    QFrame,
     QWidget,
 )
 from shapely.geometry import MultiPolygon, Polygon
@@ -3116,52 +3117,134 @@ class ImageAnnotator(QMainWindow):
 
     def setup_sidebar(self):
         self.sidebar = QWidget()
+        self.sidebar.setMinimumWidth(350)
+        self.sidebar.setMaximumWidth(470)
         self.sidebar_layout = QVBoxLayout(self.sidebar)
+        self.sidebar_layout.setContentsMargins(6, 6, 6, 6)
+        self.sidebar_layout.setSpacing(6)
         self.layout.addWidget(self.sidebar, 1)
 
-        # Helper function to create section headers
-        def create_section_header(text):
+        def help_text(text):
             label = QLabel(text)
-            label.setProperty("class", "section-header")
-            label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            label.setProperty("class", "help-text")
+            label.setWordWrap(True)
             return label
 
-        # Import functionality
-        self.import_button = QPushButton("Import Annotations with Images")
-        self.import_button.clicked.connect(self.import_annotations)
-        self.sidebar_layout.addWidget(self.import_button)
+        def group(title):
+            box = QGroupBox(title)
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(8, 12, 8, 8)
+            box_layout.setSpacing(6)
+            return box, box_layout
+
+        def scroll_page():
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(6, 6, 6, 6)
+            page_layout.setSpacing(8)
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            scroll.setWidget(page)
+            return scroll, page, page_layout
+
+        self.sidebar_tabs = QTabWidget()
+        self.sidebar_tabs.setObjectName("workflowTabs")
+        self.sidebar_layout.addWidget(self.sidebar_tabs, 1)
+
+        (
+            self.labeling_scroll,
+            self.labeling_page,
+            labeling_layout,
+        ) = scroll_page()
+        self.sidebar_tabs.addTab(self.labeling_scroll, "Labeling")
+
+        workflow_hint = QLabel(
+            "Load  >  Classes  >  Draw  >  Review  >  Export"
+        )
+        workflow_hint.setProperty("class", "workflow-hint")
+        workflow_hint.setWordWrap(True)
+        labeling_layout.addWidget(workflow_hint)
+
+        data_group, data_layout = group("1. Data and classes")
 
         self.import_format_selector = QComboBox()
         self.import_format_selector.addItem("COCO JSON")
-        self.import_format_selector.addItem("YOLO (v4 and earlier)")  # Modified name
-        self.import_format_selector.addItem("YOLO (v5+)")  # New format
+        self.import_format_selector.addItem("YOLO (v4 and earlier)")
+        self.import_format_selector.addItem("YOLO (v5+)")
+        self.import_format_selector.setToolTip(
+            "Format of an existing labeled dataset to import."
+        )
 
-        self.sidebar_layout.addWidget(self.import_format_selector)
-
-        # Add spacing
-        self.sidebar_layout.addSpacing(20)
+        self.import_button = QPushButton("Import Labels")
+        self.import_button.clicked.connect(self.import_annotations)
+        self.import_button.setToolTip(
+            "Import images together with existing COCO or YOLO labels."
+        )
+        import_layout = QHBoxLayout()
+        import_layout.addWidget(self.import_format_selector, 1)
+        import_layout.addWidget(self.import_button, 1)
+        data_layout.addLayout(import_layout)
 
         self.add_images_button = QPushButton("Add New Images")
         self.add_images_button.clicked.connect(self.add_images)
-        self.sidebar_layout.addWidget(self.add_images_button)
+        self.add_images_button.setToolTip("Add still images or an image sequence.")
 
-        self.add_class_button = QPushButton("Add Classes")
+        self.open_video_button = QPushButton("Open Video Clip...")
+        self.open_video_button.clicked.connect(self.open_video_clip)
+        self.open_video_button.setToolTip(
+            "Load only a selected frame range from a large video."
+        )
+        load_layout = QHBoxLayout()
+        load_layout.addWidget(self.add_images_button)
+        load_layout.addWidget(self.open_video_button)
+        data_layout.addLayout(load_layout)
+
+        preset_layout = QHBoxLayout()
+        self.cavitar_preset_button = QPushButton("CAVITAR Preset")
+        self.cavitar_preset_button.clicked.connect(
+            self.add_cavitar_welding_classes
+        )
+        self.cavitar_preset_button.setToolTip(
+            "Add only molten_consumable and droplet with the agreed RGB colors."
+        )
+        self.full_arc_preset_button = QPushButton("Full Arc Preset")
+        self.full_arc_preset_button.clicked.connect(
+            self.add_default_welding_classes
+        )
+        self.full_arc_preset_button.setToolTip(
+            "Add molten_consumable, droplet, external_arc, and internal_arc."
+        )
+        preset_layout.addWidget(self.cavitar_preset_button)
+        preset_layout.addWidget(self.full_arc_preset_button)
+        data_layout.addLayout(preset_layout)
+
+        self.add_class_button = QPushButton("Add Custom Class")
         self.add_class_button.clicked.connect(lambda: self.add_class())
-        self.sidebar_layout.addWidget(self.add_class_button)
+        data_layout.addWidget(self.add_class_button)
 
-        # Class list (without the "Classes" header)
+        data_layout.addWidget(QLabel("Classes"))
         self.class_list = QListWidget()
+        self.class_list.setMinimumHeight(90)
+        self.class_list.setMaximumHeight(120)
         self.class_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.class_list.customContextMenuRequested.connect(self.show_class_context_menu)
         self.class_list.itemClicked.connect(self.on_class_selected)
-        self.sidebar_layout.addWidget(self.class_list)
+        self.class_list.setToolTip(
+            "Select the class to assign before drawing an annotation."
+        )
+        data_layout.addWidget(self.class_list)
+        labeling_layout.addWidget(data_group)
 
-        self.sidebar_layout.addWidget(create_section_header("Display Adjustments"))
-        display_widget = QWidget()
-        display_layout = QGridLayout(display_widget)
+        display_group, display_group_layout = group("2. Improve visibility")
+        display_controls = QWidget()
+        display_layout = QGridLayout(display_controls)
         display_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.brightness_value_label = QLabel("0")
+        self.brightness_value_label = QLabel("+0")
         self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(-100, 100)
         self.brightness_slider.setValue(0)
@@ -3170,7 +3253,7 @@ class ImageAnnotator(QMainWindow):
         display_layout.addWidget(self.brightness_slider, 0, 1)
         display_layout.addWidget(self.brightness_value_label, 0, 2)
 
-        self.contrast_value_label = QLabel("0")
+        self.contrast_value_label = QLabel("+0")
         self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
         self.contrast_slider.setRange(-100, 100)
         self.contrast_slider.setValue(0)
@@ -3179,22 +3262,16 @@ class ImageAnnotator(QMainWindow):
         display_layout.addWidget(self.contrast_slider, 1, 1)
         display_layout.addWidget(self.contrast_value_label, 1, 2)
 
-        reset_display_button = QPushButton("Reset Display")
-        reset_display_button.clicked.connect(self.reset_display_adjustments)
-        display_layout.addWidget(reset_display_button, 2, 0, 1, 3)
-        display_note = QLabel("Preview only; source images and exports are unchanged.")
-        display_note.setWordWrap(True)
-        display_layout.addWidget(display_note, 3, 0, 1, 3)
-        self.sidebar_layout.addWidget(display_widget)
+        self.reset_display_button = QPushButton("Reset Display")
+        self.reset_display_button.clicked.connect(self.reset_display_adjustments)
+        display_layout.addWidget(self.reset_display_button, 2, 0, 1, 3)
+        display_group_layout.addWidget(display_controls)
+        display_group_layout.addWidget(
+            help_text("Preview only. Source images, masks, and exports stay unchanged.")
+        )
+        labeling_layout.addWidget(display_group)
 
-        # Annotation section
-        self.sidebar_layout.addWidget(create_section_header("Annotation"))
-        annotation_widget = QWidget()
-        annotation_layout = QVBoxLayout(annotation_widget)
-
-        # Manual tools subsection
-        manual_widget = QWidget()
-        manual_layout = QVBoxLayout(manual_widget)
+        manual_group, manual_layout = group("3. Draw and correct")
 
         button_layout_top = QHBoxLayout()
         self.polygon_button = QPushButton("Polygon")
@@ -3214,61 +3291,129 @@ class ImageAnnotator(QMainWindow):
 
         manual_layout.addLayout(button_layout_top)
         manual_layout.addLayout(button_layout_bottom)
+        manual_layout.addWidget(
+            help_text(
+                "Polygon: click around a boundary and press Enter. Use - and = "
+                "to change brush or eraser size."
+            )
+        )
+        labeling_layout.addWidget(manual_group)
 
-        annotation_layout.addWidget(manual_widget)
+        annotations_group, annotations_layout = group(
+            "4. Current-frame annotations"
+        )
+        self.annotation_list = QListWidget()
+        self.annotation_list.setMinimumHeight(110)
+        self.annotation_list.setMaximumHeight(150)
+        self.annotation_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.annotation_list.itemSelectionChanged.connect(
+            self.update_highlighted_annotations
+        )
+        annotations_layout.addWidget(self.annotation_list)
 
-        # SAM-Assisted tools subsection
-        sam_widget = QWidget()
-        sam_layout = QVBoxLayout(sam_widget)
+        sort_button_layout = QHBoxLayout()
+        self.sort_by_class_button = QPushButton("Sort by Class")
+        self.sort_by_class_button.clicked.connect(self.sort_annotations_by_class)
+        sort_button_layout.addWidget(self.sort_by_class_button)
+        self.sort_by_area_button = QPushButton("Sort by Area")
+        self.sort_by_area_button.clicked.connect(self.sort_annotations_by_area)
+        sort_button_layout.addWidget(self.sort_by_area_button)
+        annotations_layout.addLayout(sort_button_layout)
 
-        # --- Replace the old SAM-Assisted button block with this: ---
-        sam_buttons_layout = QHBoxLayout()
+        self.delete_button = QPushButton("Delete")
+        self.delete_button.clicked.connect(self.delete_selected_annotations)
+        self.merge_button = QPushButton("Merge")
+        self.merge_button.clicked.connect(self.merge_annotations)
+        self.change_class_button = QPushButton("Change Class")
+        self.change_class_button.clicked.connect(self.change_annotation_class)
+        edit_button_layout = QHBoxLayout()
+        edit_button_layout.addWidget(self.delete_button)
+        edit_button_layout.addWidget(self.merge_button)
+        edit_button_layout.addWidget(self.change_class_button)
+        annotations_layout.addLayout(edit_button_layout)
+        labeling_layout.addWidget(annotations_group)
 
-        self.sam_box_button = QPushButton("SAM-box")
-        self.sam_box_button.setCheckable(True)
-        self.sam_box_button.clicked.connect(self.toggle_sam_box)
+        export_group, export_layout = group("5. Export reviewed labels")
+        self.export_format_selector = QComboBox()
+        self.export_format_selector.addItem("COCO JSON")
+        self.export_format_selector.addItem("YOLO (v4 and earlier)")
+        self.export_format_selector.addItem("YOLO (v5+)")
+        self.export_format_selector.addItem("Labeled Images")
+        self.export_format_selector.addItem("Semantic Labels")
+        self.export_format_selector.addItem("RGB Semantic Masks")
+        self.export_format_selector.addItem("Pascal VOC (BBox)")
+        self.export_format_selector.addItem("Pascal VOC (BBox + Segmentation)")
+        export_layout.addWidget(self.export_format_selector)
 
-        self.sam_points_button = QPushButton("SAM-points")
-        self.sam_points_button.setCheckable(True)
-        self.sam_points_button.clicked.connect(self.toggle_sam_points)
+        self.export_button = QPushButton("Export Annotations")
+        self.export_button.clicked.connect(self.export_annotations)
+        export_layout.addWidget(self.export_button)
+        export_layout.addWidget(
+            help_text(
+                "For ER70S-6 training masks, choose RGB Semantic Masks and "
+                "export to a new empty folder."
+            )
+        )
+        labeling_layout.addWidget(export_group)
+        labeling_layout.addStretch(1)
 
-        sam_buttons_layout.addWidget(self.sam_box_button)
-        sam_buttons_layout.addWidget(self.sam_points_button)
-        sam_layout.addLayout(sam_buttons_layout)
-        # ------------------------------------------------------------
+        self.ai_scroll, self.ai_page, ai_layout = scroll_page()
+        self.sidebar_tabs.addTab(self.ai_scroll, "AI Assist")
+        ai_layout.addWidget(
+            help_text(
+                "AI results are proposals. Review and correct every generated mask "
+                "before exporting ground-truth labels."
+            )
+        )
 
-        # Add SAM model selector
+        sam2_group, sam2_layout = group("SAM 2 - current image")
         self.sam_model_selector = QComboBox()
         self.sam_model_selector.addItem("Pick a SAM Model")
         self.sam_model_selector.addItems(list(self.sam_utils.sam_models.keys()))
         self.sam_model_selector.currentTextChanged.connect(self.change_sam_model)
-        sam_layout.addWidget(self.sam_model_selector)
+        sam2_layout.addWidget(self.sam_model_selector)
 
-        # SAM 3 Tracking Video Tools
-        sam3_label = QLabel("SAM 3 Video Tracking:")
-        sam3_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        sam_layout.addWidget(sam3_label)
+        sam_buttons_layout = QHBoxLayout()
+        self.sam_box_button = QPushButton("Box Prompt")
+        self.sam_box_button.setCheckable(True)
+        self.sam_box_button.clicked.connect(self.toggle_sam_box)
+        self.sam_points_button = QPushButton("Point Prompts")
+        self.sam_points_button.setCheckable(True)
+        self.sam_points_button.clicked.connect(self.toggle_sam_points)
+        sam_buttons_layout.addWidget(self.sam_box_button)
+        sam_buttons_layout.addWidget(self.sam_points_button)
+        sam2_layout.addLayout(sam_buttons_layout)
+        sam2_layout.addWidget(
+            help_text("Use a box or positive/negative points to segment one image.")
+        )
+        ai_layout.addWidget(sam2_group)
 
+        sam3_group, sam3_layout = group("SAM 3 - video propagation")
         self.sam3_init_btn = QPushButton("Load Video Frames to SAM 3")
         self.sam3_init_btn.clicked.connect(self.init_sam3_tracker)
-        sam_layout.addWidget(self.sam3_init_btn)
+        sam3_layout.addWidget(self.sam3_init_btn)
 
         sam3_buttons_layout = QHBoxLayout()
         self.sam3_track_forward_btn = QPushButton("Track Selected Forward")
         self.sam3_track_forward_btn.clicked.connect(self.sam3_track_forward)
-
         self.sam3_track_all_btn = QPushButton("Track All Objects")
-        self.sam3_track_all_btn.clicked.connect(lambda: self.sam3_track_forward(all_objects=True))
-
+        self.sam3_track_all_btn.clicked.connect(
+            lambda: self.sam3_track_forward(all_objects=True)
+        )
         sam3_buttons_layout.addWidget(self.sam3_track_forward_btn)
         sam3_buttons_layout.addWidget(self.sam3_track_all_btn)
-        sam_layout.addLayout(sam3_buttons_layout)
+        sam3_layout.addLayout(sam3_buttons_layout)
+        sam3_layout.addWidget(
+            help_text(
+                "Draw a polygon in Labeling, select it in the annotation list, "
+                "then load the frames and track forward."
+            )
+        )
+        ai_layout.addWidget(sam3_group)
 
-        annotation_layout.addWidget(sam_widget)
-
-        # --- LLM-Assisted Detection (DINO) subsection ---
-        dino_widget = QWidget()
-        dino_layout = QVBoxLayout(dino_widget)
+        dino_group, dino_layout = group("Grounding DINO - object proposals")
 
         self.dino_model_selector = QComboBox()
         self.dino_model_selector.addItem("Pick a DINO Model")
@@ -3295,24 +3440,19 @@ class ImageAnnotator(QMainWindow):
 
         self.lbl_dino_status = QLabel("No DINO model loaded")
         self.lbl_dino_status.setWordWrap(True)
-        # No hardcoded background — let the active stylesheet (light or
-        # dark) provide it via QLabel rules. Hardcoded #f5f5f5 used to
-        # punch a bright rectangle into the dark sidebar.
         self.lbl_dino_status.setStyleSheet(
             "font-size:11px;padding:4px;border-radius:3px;"
-            "border:1px solid palette(mid);")
+            "border:1px solid palette(mid);"
+        )
         dino_layout.addWidget(self.lbl_dino_status)
 
-        # Threshold table
         self.dino_class_table = ClassThresholdTable()
         self.dino_class_table.itemSelectionChanged.connect(self.on_dino_class_row_changed)
         dino_layout.addWidget(self.dino_class_table)
 
-        # Phrase editor
         self.dino_phrase_panel = PhraseEditorPanel()
         dino_layout.addWidget(self.dino_phrase_panel)
 
-        # Detect buttons
         det_btn_layout = QHBoxLayout()
         self.btn_detect_single = QPushButton("Detect Current Image")
         self.btn_detect_single.clicked.connect(self.run_dino_detection_single)
@@ -3330,11 +3470,9 @@ class ImageAnnotator(QMainWindow):
         self.dino_batch_mode.addItem("Review before accepting")
         self.dino_batch_mode.addItem("Auto-accept all detections")
         dino_layout.addWidget(self.dino_batch_mode)
+        ai_layout.addWidget(dino_group)
+        ai_layout.addStretch(1)
 
-        annotation_layout.addWidget(dino_widget)
-        # --- END DINO section ---
-
-        # Add tool group
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(False)
         self.tool_group.addButton(self.polygon_button)
@@ -3348,74 +3486,6 @@ class ImageAnnotator(QMainWindow):
         self.rectangle_button.clicked.connect(self.toggle_tool)
         self.paint_brush_button.clicked.connect(self.toggle_tool)
         self.eraser_button.clicked.connect(self.toggle_tool)
-        self.sam_magic_wand_button.clicked.connect(self.toggle_tool)
-
-        # Wrap the annotation tools in a scroll area so they don't get squashed
-        tools_scroll = QScrollArea()
-        tools_scroll.setWidgetResizable(True)
-        tools_scroll.setWidget(annotation_widget)
-        tools_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        # Give it a reasonable minimum height so it doesn't completely collapse
-        tools_scroll.setMinimumHeight(250)
-        self.sidebar_layout.addWidget(tools_scroll)
-
-        # Annotations list subsection (added directly to sidebar_layout so it expands properly)
-        self.sidebar_layout.addWidget(QLabel("Annotations"))
-        self.annotation_list = QListWidget()
-        self.annotation_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.annotation_list.itemSelectionChanged.connect(
-            self.update_highlighted_annotations
-        )
-        self.sidebar_layout.addWidget(self.annotation_list)
-
-        # Create a horizontal layout for the sort buttons
-        sort_button_layout = QHBoxLayout()
-
-        self.sort_by_class_button = QPushButton("Sort by Class")
-        self.sort_by_class_button.clicked.connect(self.sort_annotations_by_class)
-        sort_button_layout.addWidget(self.sort_by_class_button)
-
-        self.sort_by_area_button = QPushButton("Sort by Area")
-        self.sort_by_area_button.clicked.connect(self.sort_annotations_by_area)
-        sort_button_layout.addWidget(self.sort_by_area_button)
-
-        # Add the sort button layout to the sidebar layout
-        self.sidebar_layout.addLayout(sort_button_layout)
-
-        # Delete and Merge annotation buttons
-        self.delete_button = QPushButton("Delete")
-        self.delete_button.clicked.connect(self.delete_selected_annotations)
-        self.merge_button = QPushButton("Merge")
-        self.merge_button.clicked.connect(self.merge_annotations)
-        self.change_class_button = QPushButton("Change Class")
-        self.change_class_button.clicked.connect(self.change_annotation_class)
-
-        # Create a horizontal layout for the other buttons
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(self.delete_button)
-        button_layout.addWidget(self.merge_button)
-        button_layout.addWidget(self.change_class_button)
-
-        # Add the button layout to the sidebar layout
-        self.sidebar_layout.addLayout(button_layout)
-
-        # Add export format selector
-        self.export_format_selector = QComboBox()
-        self.export_format_selector.addItem("COCO JSON")
-        self.export_format_selector.addItem("YOLO (v4 and earlier)")  # Modified name
-        self.export_format_selector.addItem("YOLO (v5+)")  # New format
-        self.export_format_selector.addItem("Labeled Images")
-        self.export_format_selector.addItem("Semantic Labels")
-        self.export_format_selector.addItem("RGB Semantic Masks")
-        self.export_format_selector.addItem("Pascal VOC (BBox)")
-        self.export_format_selector.addItem("Pascal VOC (BBox + Segmentation)")
-
-        self.sidebar_layout.addWidget(QLabel("Export Format:"))
-        self.sidebar_layout.addWidget(self.export_format_selector)
-
-        self.export_button = QPushButton("Export Annotations")
-        self.export_button.clicked.connect(self.export_annotations)
-        self.sidebar_layout.addWidget(self.export_button)
 
     def update_display_adjustments(self):
         brightness = self.brightness_slider.value()
