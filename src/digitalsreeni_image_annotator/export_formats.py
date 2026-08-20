@@ -1,5 +1,5 @@
 import json
-from PyQt6.QtGui import QImage
+from PyQt6.QtGui import QColor, QImage
 from .utils import calculate_area, calculate_bbox
 import yaml
 import os
@@ -273,7 +273,7 @@ def export_yolo_v5plus(all_annotations, class_mapping, image_paths, slices, imag
 
     print(f"[YOLO v5+] export: {len(all_annotations)} image entries, "
           f"{len(image_paths)} known image paths, "
-          f"{len(class_to_index)} class(es) → {list(class_to_index.keys())}")
+          f"{len(class_to_index)} class(es) -> {list(class_to_index.keys())}")
 
     label_files_written = 0
     for image_name, annotations in all_annotations.items():
@@ -579,6 +579,220 @@ def export_semantic_labels(all_annotations, class_mapping, image_paths, slices, 
         f.write("Pixel Value : Class Name\n")
         for class_name, pixel_value in class_to_pixel.items():
             f.write(f"{pixel_value} : {class_name}\n")
+
+    return output_dir
+
+
+
+def _color_to_rgb(color):
+    if isinstance(color, QColor):
+        return color.red(), color.green(), color.blue()
+    converted = QColor(color)
+    if not converted.isValid():
+        raise ValueError(f"Invalid class color: {color!r}")
+    return converted.red(), converted.green(), converted.blue()
+
+
+def _find_export_image_path(image_name, image_paths):
+    direct = image_paths.get(image_name)
+    if direct:
+        return direct
+    for stored_name, path in image_paths.items():
+        if os.path.basename(stored_name) == image_name:
+            return path
+        if os.path.basename(path) == image_name:
+            return path
+    return None
+
+
+def _annotation_coverage(height, width, annotation):
+    coverage = np.zeros((height, width), dtype=bool)
+    segmentation = annotation.get("segmentation")
+    if segmentation is not None and len(segmentation):
+        polygons = (
+            segmentation
+            if isinstance(segmentation[0], (list, tuple, np.ndarray))
+            else [segmentation]
+        )
+        for polygon_values in polygons:
+            polygon = np.asarray(polygon_values, dtype=np.float64).reshape(-1, 2)
+            if len(polygon) < 3:
+                continue
+            rows, columns = skimage.draw.polygon(
+                polygon[:, 1], polygon[:, 0], (height, width)
+            )
+            coverage[rows, columns] = True
+        return coverage
+
+    bbox = annotation.get("bbox")
+    if bbox:
+        x, y, box_width, box_height = map(int, bbox)
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(width, x + box_width), min(height, y + box_height)
+        coverage[y0:y1, x0:x1] = True
+    return coverage
+
+
+def _rgb_export_inventory(all_annotations, image_paths, slices, image_slices):
+    names = []
+    seen = set()
+
+    def add(name):
+        name = str(name)
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+
+    for image_name in image_paths:
+        add(os.path.basename(image_name))
+    for slice_name, _qimage in slices:
+        add(slice_name)
+    for stack_slices in image_slices.values():
+        for slice_name, _qimage in stack_slices:
+            add(slice_name)
+    for image_name in all_annotations:
+        add(image_name)
+    return names
+
+
+def export_rgb_semantic_masks(
+    all_annotations,
+    class_colors,
+    image_paths,
+    slices,
+    image_slices,
+    output_dir,
+):
+    """Export dense RGB masks using the project's configured class colors."""
+    output_dir = os.path.abspath(os.fspath(output_dir))
+    os.makedirs(output_dir, exist_ok=True)
+    final_images_dir = os.path.join(output_dir, "images")
+    final_masks_dir = os.path.join(output_dir, "rgb_masks")
+    if os.path.lexists(final_images_dir) or os.path.lexists(final_masks_dir):
+        raise ValueError(
+            "RGB mask export requires an unused output directory. "
+            "Choose a directory without existing 'images' or 'rgb_masks' folders."
+        )
+
+    rgb_colors = {
+        name: _color_to_rgb(color)
+        for name, color in class_colors.items()
+        if not name.startswith("Temp-")
+    }
+    class_names = list(rgb_colors)
+    slice_map = {slice_name: qimage for slice_name, qimage in slices}
+    for stack_slices in image_slices.values():
+        slice_map.update(stack_slices)
+
+    with tempfile.TemporaryDirectory(prefix=".rgb-export-", dir=output_dir) as staging:
+        images_dir = os.path.join(staging, "images")
+        masks_dir = os.path.join(staging, "rgb_masks")
+        os.makedirs(images_dir)
+        os.makedirs(masks_dir)
+        used_image_names = set()
+        used_mask_names = set()
+
+        for image_name in _rgb_export_inventory(
+            all_annotations,
+            image_paths,
+            slices,
+            image_slices,
+        ):
+            annotations = all_annotations.get(image_name, {})
+            qimage = slice_map.get(image_name)
+            if qimage is not None:
+                logical_name = os.path.basename(image_name)
+                file_name = (
+                    logical_name
+                    if os.path.splitext(logical_name)[1]
+                    else f"{logical_name}.png"
+                )
+                image_output = os.path.join(images_dir, file_name)
+                if not qimage.save(image_output):
+                    raise OSError(
+                        f"Could not write exported image '{image_output}'."
+                    )
+                width, height = qimage.width(), qimage.height()
+            else:
+                source_path = _find_export_image_path(image_name, image_paths)
+                if not source_path:
+                    print(f"No image path found for {image_name}, skipping")
+                    continue
+                if source_path.lower().endswith((".tif", ".tiff", ".czi")):
+                    print(f"Skipping main tiff/czi file: {image_name}")
+                    continue
+                file_name = os.path.basename(source_path)
+                image_output = os.path.join(images_dir, file_name)
+                shutil.copy2(source_path, image_output)
+                with Image.open(source_path) as source_image:
+                    width, height = source_image.size
+
+            image_key = file_name.casefold()
+            if image_key in used_image_names:
+                raise ValueError(
+                    f"Two project images would export as '{file_name}'. "
+                    "Rename one source image before exporting."
+                )
+            used_image_names.add(image_key)
+
+            mask_name = f"{file_name}_rgb_mask.png"
+            mask_key = mask_name.casefold()
+            if mask_key in used_mask_names:
+                raise ValueError(
+                    f"Two project images would export the same mask '{mask_name}'."
+                )
+            used_mask_names.add(mask_key)
+
+            rgb_mask = np.zeros((height, width, 3), dtype=np.uint8)
+            owners = np.full((height, width), -1, dtype=np.int32)
+            for class_name, class_annotations in (annotations or {}).items():
+                if class_name.startswith("Temp-"):
+                    continue
+                if class_name not in rgb_colors:
+                    raise ValueError(
+                        f"No export color is configured for class '{class_name}'."
+                    )
+                class_index = class_names.index(class_name)
+                for annotation in class_annotations:
+                    coverage = _annotation_coverage(height, width, annotation)
+                    conflicting = (owners >= 0) & (owners != class_index) & coverage
+                    if conflicting.any():
+                        previous_index = int(owners[conflicting][0])
+                        raise ValueError(
+                            f"Overlapping class annotations in '{image_name}': "
+                            f"'{class_names[previous_index]}' and '{class_name}'. "
+                            "Correct the overlap before exporting."
+                        )
+                    rgb_mask[coverage] = rgb_colors[class_name]
+                    owners[coverage] = class_index
+
+            Image.fromarray(rgb_mask, mode="RGB").save(
+                os.path.join(masks_dir, mask_name)
+            )
+
+        mapping_path = os.path.join(masks_dir, "class_rgb_mapping.txt")
+        with open(mapping_path, "w", encoding="utf-8") as mapping_file:
+            mapping_file.write("Background: 0, 0, 0\n")
+            for class_name, color in rgb_colors.items():
+                mapping_file.write(
+                    f"{class_name}: {color[0]}, {color[1]}, {color[2]}\n"
+                )
+
+        committed = []
+        try:
+            if os.path.lexists(final_images_dir) or os.path.lexists(final_masks_dir):
+                raise ValueError(
+                    "The RGB export destination changed during export. "
+                    "Choose a new output directory."
+                )
+            os.replace(images_dir, final_images_dir)
+            committed.append(final_images_dir)
+            os.replace(masks_dir, final_masks_dir)
+            committed.append(final_masks_dir)
+        except Exception:
+            for committed_dir in committed:
+                shutil.rmtree(committed_dir, ignore_errors=True)
+            raise
 
     return output_dir
 

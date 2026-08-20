@@ -11,6 +11,10 @@ A rectangular annotation defined by `[x, y, width, height]` in COCO format. Stor
 ### Class
 A category label for annotations (e.g., "cell", "nucleus", "mitochondria"). Each class has an ID and color.
 
+### Clip
+A selected inclusive range of frames from a longer video, optionally sampled
+with a stride. Clips are decoded to disk-backed image sequences for labeling.
+
 ### COCO Format
 Common Objects in Context - a standardized JSON format for object detection and segmentation annotations. Includes images, categories, and annotations with segmentation polygons or bounding boxes.
 
@@ -50,8 +54,21 @@ Annotation mode where user clicks positive points (inside object) and negative p
 ### Semantic Labels
 Single-channel image where each pixel value represents the class ID. Used for semantic segmentation training.
 
+### RGB Semantic Mask
+Three-channel image where each pixel's RGB value identifies its class. The
+ER70S-6 workflow uses black background plus the exact team palette configured
+by the welding presets.
+
 ### Slice
 A 2D image extracted from a multi-dimensional image stack. Named with format `{filename}_T{t}_Z{z}_C{c}_S{s}`.
+
+### Source Frame Index
+The original zero-based position of a frame in its source video. It is kept
+separately from the frame's position inside a selected clip.
+
+### Stride
+The interval used when sampling video frames. A stride of `1` keeps every
+frame; a stride of `5` keeps frames 0, 5, 10, and so on within the selection.
 
 ### Stack
 A multi-dimensional image, typically a TIFF or CZI file with multiple 2D slices in Z-dimension (depth).
@@ -113,6 +130,8 @@ A series of 2D images taken at different focal depths (Z positions), used in mic
 | `ImageAnnotator` | annotator_window.py | Main application window (QMainWindow) |
 | `ImageLabel` | image_label.py | Custom QLabel for image display and interaction |
 | `SAMUtils` | sam_utils.py | SAM model loading and inference |
+| `FrameSequence` | video_sequence.py | Clip order and source-frame identity |
+| `VideoClipDialog` | video_clip_dialog.py | Video range/stride selection |
 | `DimensionDialog` | annotator_window.py | Dialog for assigning dimensions to stacks |
 | `TrainingThread` | annotator_window.py | Background thread for YOLO training |
 | `YOLOTrainer` | yolo_trainer.py | YOLO model training and prediction |
@@ -127,6 +146,7 @@ A series of 2D images taken at different focal depths (Z positions), used in mic
 - `annotations`: Dict mapping filename/slice to list of annotation dicts
 - `image_dimensions`: Dict mapping filename to dimension string (e.g., "TZCYX")
 - `image_shapes`: Dict mapping filename to shape tuple
+- `video_sessions`: Optional per-clip source metadata and ordered frame mappings
 
 ### Annotation Dict
 - `segmentation`: Flattened polygon coordinates `[x1, y1, x2, y2, ...]`

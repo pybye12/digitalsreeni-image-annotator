@@ -31,10 +31,11 @@ Dr. Sreenivas Bhattiprolu
 - Save As... and Autosave functionality.
 - A secret game, for when you are bored.
 - Import existing COCO JSON annotations with images.
-- Export annotations to various formats (COCO JSON, YOLO v8/v11, Labeled images, Semantic labels, Pascal VOC).
+- Export annotations to COCO JSON, YOLO v8/v11, labeled images, class-ID semantic labels, RGB semantic masks, and Pascal VOC.
 - Handle multi-dimensional images (TIFF stacks and CZI files).
 - Zoom and pan for detailed annotations.
 - Support for multiple classes with customizable colors.
+- Non-destructive brightness and contrast controls for revealing faint boundaries.
 - User-friendly interface with intuitive controls.
 - Change the application font size on the fly — Make your annotations as big or small as your caffeine level requires.
 - Dark mode for those late-night annotation marathons — Who needs sleep when you have dark mode?
@@ -70,6 +71,25 @@ Dr. Sreenivas Bhattiprolu
 This application is built using PyQt6 and runs on macOS, Windows and Linux. On Linux you'll need the standard Qt 6 runtime libraries (notably `libxcb-cursor0`, `libegl1`, `libgl1`, and the XCB plugin set) — `sudo apt install libxcb-cursor0 libegl1 libgl1 libxcb-xinerama0 libxkbcommon-x11-0` covers the common ones on Debian/Ubuntu.
 
 ## Installation
+
+### Install this video-labeling fork from source
+
+To use the large-video, SAM 3 tracking, ER70S-6 preset, display adjustment,
+and RGB-mask export changes from Abdul's development branch:
+
+```bash
+git clone --branch abdul/welding-video-extension --single-branch https://github.com/pybye12/digitalsreeni-image-annotator.git
+cd digitalsreeni-image-annotator
+python -m venv .venv
+source .venv/Scripts/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+sreeni
+```
+
+On Linux or macOS, activate with `source .venv/bin/activate`. On PowerShell,
+use `.venv\Scripts\Activate.ps1`.
+The PyPI release described below does not include this branch's additions yet.
 
 ### Watch the installation walkthough video:
 
@@ -124,7 +144,8 @@ You should see `True` and your GPU name. For other platforms or driver combinati
 
    - Click "New Project" or use Ctrl+N to start a new project.
    - Use "Add New Images" to import images, including TIFF stacks and CZI files.
-   - Add classes using the "Add Classes" button.
+   - Add classes using the "Add Classes" button. Welding projects can use the ER70S-6 presets under the **Welding** menu.
+   - Adjust brightness and contrast when boundaries are faint. These controls affect only the preview, not source images or exports.
    - Select a class and use the Polygon or Rectangle or Paint Brush tool to create manual annotations.
    - To use SAM2-assisted annotation:
      - Select a model from the "Pick a SAM Model" dropdown. It's recommended to use smaller models like SAM2 tiny or SAM2 small. SAM2 large is not recommended as it may crash the application on systems with limited resources.
@@ -148,7 +169,7 @@ You should see `True` and your GPU name. For other platforms or driver combinati
    - Save your project using "Save Project" or Ctrl+S. Alternatively, you can use Save As... to save the project with a different name.
    - Use "Open Project" or Ctrl+O to load a previously saved project.
    - Click "Import Annotations with Images" to load existing COCO JSON annotations along with their images.
-   - Use "Export Annotations" to save annotations in various formats (COCO JSON, YOLO v8/v11, Labeled images, Semantic labels, Pascal VOC).
+   - Use "Export Annotations" to save annotations in various formats (COCO JSON, YOLO v8/v11, labeled images, class-ID semantic labels, RGB semantic masks, and Pascal VOC).
      - Note: YOLO export (and import) is now compatible with YOLOv11 structure. (Project directory includes data.yaml, train, and valid directories, with train and valid both having images and labels subdirectories.)
    - Project Details:
      - Access project details by selecting "Project Details" from the Project menu.
@@ -197,7 +218,34 @@ This fork adds an optional SAM 3 workflow for propagating a manually labeled
 object through extracted video frames. SAM 3 does not decide whether a region
 is an `internal_arc`, `external_arc`, `droplet`, or `molten_consumable`. The
 user chooses the class and draws the starting polygon; SAM 3 then attempts to
-follow that same visual region in later frames.
+follow that same visual region in later frames. The tracker applies the same
+minimum-area, relative-size, and drift checks to every class; very small
+polygons may be rejected as tracking noise.
+
+### Open a large video as a manageable clip
+
+Use **Video > Open Video Clip...** to work directly from MP4, AVI, MOV, MKV,
+M4V, or WMV files. The clip dialog reports the video's size, frame count, FPS,
+and duration. Choose an inclusive start frame, inclusive end frame, and stride
+(`1` keeps every frame, `5` keeps every fifth frame).
+
+The application decodes the selected range on a background thread and writes
+one frame at a time to a temporary cache. The same worker copies those frames
+into the project's `images/` directory before the clip appears, so a large
+import does not freeze the interface during save. It never keeps the full video
+in RAM. Press **Cancel** to roll back extraction and copying. The extracted
+frames use collision-resistant names, appear in the normal image list, and
+retain their original source-frame numbers in the status bar.
+
+Use **A** and **D** to move backward and forward, **C** to copy a selected
+annotation to the next frame, and the existing Polygon, Paint Brush, and Eraser
+tools to correct masks. Saving the `.iap` commits the clip order and
+source-frame mapping for the next session. Multiple imported clips retain
+separate source mappings; selecting a
+frame activates its clip for A/D navigation and tracking. The class list
+remains fully user-defined.
+Extracted project frames use lossless PNG by default so faint scientific image
+boundaries are not changed by a second lossy encoding step.
 
 ### Install and launch on Windows with Git Bash
 
@@ -205,7 +253,7 @@ Run these commands from Git Bash. Python 3.11 is recommended for the current
 SAM 3 environment.
 
 ```bash
-git clone https://github.com/pybye12/digitalsreeni-image-annotator.git
+git clone --branch abdul/welding-video-extension --single-branch https://github.com/pybye12/digitalsreeni-image-annotator.git
 cd digitalsreeni-image-annotator
 
 py -3.11 -m venv .venv
@@ -226,9 +274,9 @@ require this checkpoint.
 
 ### Track an annotation forward
 
-1. Select **Video > Open Frame Folder...** and choose one folder containing a
-   numerically named image sequence.
-2. Select **Welding > Add Default Welding Classes**.
+1. Select **Video > Open Video Clip...** and choose a frame range, or select
+   **Video > Open Frame Folder...** for an already extracted image sequence.
+2. Select **Welding > Add ER70S-6 Full Arc Classes**, or choose the CAVITAR preset when labeling only molten consumable and droplets.
 3. Choose the class you want to label.
 4. Use **Polygon** to outline the object on a clear starting frame, then press
    **Enter** to finish the polygon.
@@ -271,8 +319,7 @@ decided from the reviewed sequences and the agreed labeling protocol. If SAM 3
 drifts, the manual drawing tools remain available for producing ground-truth
 arc labels.
 
-For implementation details, limitations, and completed engineering checks, see
-[SAM 3 Welding Video Annotator Adaptation](docs/SAM3_WELDING_VIDEO_ADAPTATION.md).
+For the team palette and boundary rules, see the [ER70S-6 Labeling Protocol](docs/ER70S6_LABELING_PROTOCOL.md). For implementation details, limitations, and completed engineering checks, see [SAM 3 Welding Video Annotator Adaptation](docs/SAM3_WELDING_VIDEO_ADAPTATION.md).
 
 ## Known Issues and Bug Fixes
 

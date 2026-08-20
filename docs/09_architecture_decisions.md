@@ -55,27 +55,27 @@
 
 ---
 
-## ADR-004: No Automated Testing Framework
+## ADR-004: Automated Regression Testing
 
-**Status**: Accepted (Technical Debt)
+**Status**: Accepted (supersedes the original manual-only decision)
 
-**Context**: Application is GUI-heavy with complex interactions
+**Context**: The application is GUI-heavy, but utility, persistence, export,
+video-import, and selected Qt behavior can be tested deterministically.
 
-**Decision**: Rely on manual testing only
+**Decision**: Maintain a pytest suite with unit, integration, and focused
+pytest-qt UI tests. Keep manual testing for visual quality, model inference,
+platform behavior, and complete annotator workflows.
 
 **Rationale**:
-- PyQt testing requires significant setup (pytest-qt, fixtures)
-- Visual nature of tool makes automated testing difficult
-- Small development team
-- Rapid iteration on features
+- Unit tests catch data and conversion regressions quickly.
+- Integration tests exercise project transactions and video workflows.
+- Focused UI tests cover event routing and the presence of critical controls.
+- Visual mask quality and GPU behavior still require manual observation.
 
 **Consequences**:
-- ❌ Risk of regressions
-- ❌ Manual testing required for all changes
-- ❌ Slower development velocity for large refactors
-- ✅ Lower initial development overhead
-
-**Future Consideration**: Add unit tests for utility functions (calculate_area, conversions)
+- Automated tests are required for changed deterministic behavior.
+- Manual tests remain required for new annotation and inference features.
+- The suite requires pytest-qt and an offscreen Qt platform in headless runs.
 
 ---
 
@@ -317,7 +317,8 @@ Migrating the GUI from PyQt5 to PyQt6 (same PR) eliminates the DLL conflict — 
 
 **Verification**:
 - `tools/check_pyqt6_torch_coexistence.py` imports PyQt6 → torch → torchvision → transformers → ultralytics in that order. Run before merging on the Windows + Python 3.14 target.
-- 65 tests pass on the new binding under `QT_QPA_PLATFORM=offscreen`.
+- The full automated suite passed on the new binding under
+  `QT_QPA_PLATFORM=offscreen` during the migration.
 - Full app constructs and renders headlessly; snake-game easter egg validates the `QDesktopWidget` → `QGuiApplication.primaryScreen()` replacement.
 
 **Related**:
@@ -355,7 +356,9 @@ Three options were considered:
 **Decision**: Option 3. Implement `_DINOReviewEventFilter`, install it
 on `QApplication.instance()` once at startup, and gate the
 interception on three conditions: pending DINO temp_annotations,
-no active modal widget, focus not on `QLineEdit`/`QTextEdit`.
+no active modal widget, focus not on `QLineEdit`/`QTextEdit`. While synchronous
+SAM 3 inference pumps Qt events, Enter/Escape is consumed without applying a
+DINO review action.
 
 **Consequences**:
 - ✅ Enter/Escape works regardless of which widget holds focus during
@@ -378,7 +381,7 @@ no active modal widget, focus not on `QLineEdit`/`QTextEdit`.
 
 ---
 
-## ADR-016: Use SAM 3 Session Predictor with Object Point Prompts
+## ADR-016: Use SAM 3 Session Predictor with Polygon-Derived Prompts
 
 **Status**: Accepted (June 8, 2026)
 
@@ -388,15 +391,17 @@ frames. Meta's dense SAM 3 box prompt is a semantic visual prompt, resets dense
 tracking state, and does not provide a one-box-to-one-object-ID contract.
 
 **Decision**: Integrate Meta SAM 3 through `build_sam3_video_predictor` and its
-session request API. Convert each source polygon to an interior representative
-point, submit it with an explicit object ID, propagate forward, and store masks
-using the existing flattened `segmentation` annotation schema.
+session request API. Convert each source polygon to a binary mask and submit it
+with an explicit object ID when the installed predictor exposes mask seeding.
+Otherwise derive dense foreground/background refinement points from that mask.
+Propagate forward and store results using the existing flattened
+`segmentation` annotation schema.
 
 **Consequences**:
 - Multiple labeled objects retain independent object IDs and classes.
 - Existing project saving, rendering, and export code remains reusable.
-- A single interior point can be ambiguous for difficult welding imagery, so
-  users must review results and future work may add interactive corrections.
+- Polygon-derived masks and refinement points preserve more spatial context
+  than a single click, but users must still review propagated results.
 - SAM 3 remains optional and has stricter CUDA/Python requirements than the
   base annotator.
 - When neither `cc_torch` nor Triton is available, the adapter uses Meta's
@@ -408,23 +413,70 @@ using the existing flattened `segmentation` annotation schema.
 
 ---
 
+## ADR-017: Extract Selected Video Ranges to a Disk-Backed Frame Sequence
+
+**Status**: Accepted (August 7, 2026)
+
+**Context**: High-speed research videos can contain enough frames to exhaust
+RAM if a labeling tool decodes the whole video up front. The existing
+annotation, rendering, export, and tracking paths already operate on image
+filenames, so introducing a second video-only annotation model would duplicate
+state and increase project-format risk.
+
+**Decision**: Probe video metadata first, then let the user choose an inclusive
+frame range and stride. Decode that range sequentially on a cancellable
+`QThread`, write selected frames to a fingerprinted application-cache folder,
+and copy them into the project image directory on the same worker. Register the
+session only after copying completes, and roll back registration and files if
+the `.iap` commit fails. The commit flushes and fsyncs a same-directory
+temporary file, atomically replaces the previous project, and attempts a
+parent-directory fsync on POSIX. Persist only per-clip video metadata and
+filename-to-source-frame mappings in `video_sessions`; runtime cache paths are
+never deserialized.
+
+**Consequences**:
+- Peak decode memory is bounded to approximately one video frame plus encoder
+  buffers, independent of source-video length.
+- Large frame copies stay off the GUI thread and are cancellable.
+- A failed JSON write cannot truncate the previous project file.
+- Generic project image copies are staged and rolled back with the same save
+  result contract, so a partial copy cannot become a committed project image.
+- Save adopts an occupied project-image path only after verifying that its
+  bytes match the source; mismatched same-named images abort the transaction.
+- Smaller clips and temporal downsampling reduce disk use and annotation load.
+- Manual correction, classes, exports, and current tracking code are reused.
+- Imported frames are project-local before session registration, so projects
+  remain self-contained.
+- Multiple clips are persisted independently and selecting one of their frames
+  activates the corresponding sequence.
+- Tracking uses an isolated, position-numbered workspace rather than the
+  project's shared image directory, preventing positional index drift.
+- Extracted frames use lossless PNG by default so the import step does not add
+  compression artifacts to faint scientific boundaries.
+- SAM2 or EfficientTAM propagation can be added behind the frame-sequence
+  workflow without changing the annotation schema.
+
+**Related**: `video_clip.py`, `video_clip_dialog.py`, `video_sequence.py`, and
+[Bounded-Memory Video Loading](08_crosscutting_concepts.md#bounded-memory-video-loading).
+
+---
+
 ## Decisions Under Consideration
 
-### Consider pytest-qt for Utility Testing
+### Expand Model and Performance Testing
 
 **Status**: Under Consideration
 
-**Proposal**: Add unit tests for non-GUI utilities (calculate_area, coordinate conversions, export functions)
+**Proposal**: Add benchmark videos and opt-in GPU model tests for long-running
+SAM2, SAM3, EfficientTAM, and large-video workflows.
 
 **Pros**:
-- Catch regressions in utility functions
-- Build confidence for refactoring
-- Document expected behavior
+- Detect memory and throughput regressions.
+- Validate real model loading and propagation across supported platforms.
 
 **Cons**:
-- Setup overhead
-- Maintenance burden
-- May not catch most bugs (which are in GUI)
+- Large model downloads and specialized GPU requirements.
+- Longer, less deterministic CI runs.
 
 ---
 

@@ -34,6 +34,19 @@ src/digitalsreeni_image_annotator/
 └── utils.py                       # Utility functions
 ```
 
+### Video Clip Subsystem
+
+| Module | Responsibility |
+|--------|----------------|
+| `video_clip.py` | Pure video-domain layer. Probes metadata, validates inclusive frame selections, creates stable cache paths, streams selected frames through OpenCV, copies them transactionally, and validates managed-cache cleanup boundaries. |
+| `video_clip_dialog.py` | PyQt6 presentation layer. Collects start/end/stride and runs extraction plus project copying on a cancellable `QThread`. |
+| `video_sequence.py` | Maps list position, extracted filename, and original source-frame index. Used by navigation, project persistence, and tracking. |
+
+`ImageAnnotator.video_sessions` stores source metadata and ordered frame
+mappings for every imported clip. The existing `all_annotations[frame_name]`
+structure remains the
+single annotation store; video support does not introduce a parallel schema.
+
 ### ImageAnnotator (annotator_window.py)
 
 **Responsibility**: Main application window and state management
@@ -156,7 +169,8 @@ export time — see [Cross-cutting Concepts](08_crosscutting_concepts.md)).
 - `export_yolo_v5plus()`: YOLOv11-compatible structure
 - `export_yolo_v4()`: Legacy YOLO format
 - `export_labeled_images()`: Colored overlay visualizations
-- `export_semantic_labels()`: Single-channel label images
+- `export_semantic_labels()`: Single-channel class-ID label images
+- `export_rgb_semantic_masks()`: Dense RGB masks using configured class colors
 - `export_pascal_voc_bbox()`: Pascal VOC XML (bounding boxes)
 
 **Data Flow**:
@@ -200,7 +214,8 @@ Each tool is a standalone dialog/window:
 |--------|----------------|
 | `video_sequence.py` | Loads extracted frames using Meta SAM 3's ordering and maps names to tracker indices. |
 | `sam3_tracker.py` | Wraps Meta's session-based SAM 3 video predictor, propagates object-ID point prompts, and converts masks to flattened polygons. |
-| `welding_defaults.py` | Defines welding annotation classes and colors. |
+| `welding_defaults.py` | Defines optional ER70S-6 full-arc and CAVITAR class presets. |
+| `display_adjustments.py` | Applies non-destructive brightness/contrast transforms to the preview image. |
 
 SAM 3 remains separate from `SAMUtils`: SAM 2 owns single-image assistance,
 while `SAM3Tracker` owns an optional Meta SAM 3 video session. Both use the

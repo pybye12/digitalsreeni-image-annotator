@@ -1,8 +1,8 @@
 """SAM 3 video tracking adapter.
 
 This module wraps Meta's supported session-based video predictor API. Existing
-annotation polygons become dense point prompts so the user's exact large
-droplet selection, rather than an ambiguous bright region, seeds tracking.
+annotation polygons become mask or dense point prompts so the user's exact
+object selection, rather than an ambiguous image region, seeds tracking.
 """
 
 from __future__ import annotations
@@ -287,11 +287,12 @@ class SAM3Tracker:
         return results
 
     def track_polygons(self, frame_idx, object_polygons, frame_size):
-        """Initialize large droplets from exact polygons and propagate forward.
+        """Initialize objects from exact polygons and propagate forward.
 
         Each output object is reduced to its largest connected component.
         Components smaller than a conservative fraction of the source polygon
-        are ignored so welding spatter is not emitted as a droplet annotation.
+        are ignored as likely tracking noise. These geometric gates apply to
+        every class; this adapter does not inspect class names.
         """
         if not self.is_initialized:
             raise RuntimeError("Call init_state before tracking.")
@@ -315,7 +316,7 @@ class SAM3Tracker:
             source_areas[int(object_id)] = source_area
             source_masks[int(object_id)] = source_mask
         if not prompts:
-            raise ValueError("No valid large-droplet polygons supplied.")
+            raise ValueError("No valid object polygons supplied.")
 
         with self._cuda_autocast_context():
             self.predictor.handle_request(
@@ -533,7 +534,7 @@ class SAM3Tracker:
 
     @classmethod
     def largest_plausible_segmentation(cls, mask, source_area, frame_area):
-        """Return only a droplet-sized main component from a tracked mask."""
+        """Return the largest geometrically plausible tracked component."""
         binary_mask = (np.asarray(mask) > 0).astype(np.uint8)
         contours, _ = cv2.findContours(
             binary_mask,

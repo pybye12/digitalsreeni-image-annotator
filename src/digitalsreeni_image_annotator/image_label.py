@@ -31,6 +31,8 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
+from .display_adjustments import adjust_qimage
+
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
@@ -54,7 +56,10 @@ class ImageLabel(QLabel):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.original_pixmap = None
+        self.display_pixmap = None
         self.scaled_pixmap = None
+        self.display_brightness = 0
+        self.display_contrast = 0
         self.pan_start_pos = None
         self.main_window = None
         self.offset_x = 0
@@ -103,7 +108,26 @@ class ImageLabel(QLabel):
         if isinstance(pixmap, QImage):
             pixmap = QPixmap.fromImage(pixmap)
         self.original_pixmap = pixmap
+        self._refresh_display_pixmap()
         self.update_scaled_pixmap()
+
+    def set_display_adjustments(self, brightness, contrast):
+        """Adjust only the rendered preview, preserving the source pixmap."""
+        self.display_brightness = int(brightness)
+        self.display_contrast = int(contrast)
+        self._refresh_display_pixmap()
+        self.update_scaled_pixmap()
+
+    def _refresh_display_pixmap(self):
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            adjusted = adjust_qimage(
+                self.original_pixmap.toImage(),
+                self.display_brightness,
+                self.display_contrast,
+            )
+            self.display_pixmap = QPixmap.fromImage(adjusted)
+        else:
+            self.display_pixmap = None
 
     def detect_bit_depth(self):
         """Detect and store the actual image bit depth using PIL."""
@@ -126,9 +150,9 @@ class ImageLabel(QLabel):
                     self.main_window.update_image_info()
 
     def update_scaled_pixmap(self):
-        if self.original_pixmap and not self.original_pixmap.isNull():
-            scaled_size = self.original_pixmap.size() * self.zoom_factor
-            self.scaled_pixmap = self.original_pixmap.scaled(
+        if self.display_pixmap and not self.display_pixmap.isNull():
+            scaled_size = self.display_pixmap.size() * self.zoom_factor
+            self.scaled_pixmap = self.display_pixmap.scaled(
                 scaled_size.width(),
                 scaled_size.height(),
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -589,6 +613,7 @@ class ImageLabel(QLabel):
         self.end_point = None
         self.highlighted_annotations.clear()
         self.original_pixmap = None
+        self.display_pixmap = None
         self.scaled_pixmap = None
         self.editing_polygon = None
         self.editing_point_index = None

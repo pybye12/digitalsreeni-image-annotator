@@ -85,26 +85,27 @@
 
 ## Technical Debt
 
-### No Automated Tests
+### Test Coverage Expansion
 
-**Debt Level**: High
+**Debt Level**: Medium
 
-**Description**: Zero unit tests, integration tests, or UI tests
+**Description**: The project has unit, integration, and pytest-qt coverage, but
+GPU-backed model execution and long-running interactive workflows still need
+manual checks on supported hardware.
 
 **Impact**:
-- High risk of regressions
-- Refactoring is dangerous
-- Manual testing burden
-- Slow development velocity
+- CUDA/model-package combinations can regress outside CI coverage
+- Codec and platform-specific video behavior needs representative fixtures
+- Visual annotation quality still requires human review
 
-**Effort to Resolve**: High (months)
+**Effort to Resolve**: Ongoing
 
 **Priority**: Medium
 
 **Plan**:
-1. Add unit tests for utility functions first (low-hanging fruit)
-2. Add integration tests for export/import
-3. Consider pytest-qt for critical UI flows
+1. Keep unit and integration coverage with each behavior change
+2. Add small deterministic codec fixtures where licensing permits
+3. Retain feature-specific manual checklists for GPU and visual workflows
 
 ---
 

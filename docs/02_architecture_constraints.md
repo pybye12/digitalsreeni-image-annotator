@@ -14,7 +14,7 @@
 | Constraint | Description |
 |------------|-------------|
 | **Open Source** | MIT License |
-| **No Automated Tests** | Manual testing only (current state) |
+| **Automated and Manual Tests** | pytest/pytest-qt regression suite plus feature-specific manual checks |
 | **Fork Maintenance** | Maintain compatibility with upstream changes |
 
 ## Platform Constraints

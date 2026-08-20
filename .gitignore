@@ -19,6 +19,7 @@ models/
 
 # Generated annotation exports
 outputs/
+/tmp/
 
 # Python cache and build artifacts
 __pycache__/

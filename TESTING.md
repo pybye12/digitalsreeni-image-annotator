@@ -25,7 +25,8 @@ This document describes the testing infrastructure for the DigitalSreeni Image A
    │   ├── __init__.py
    │   └── test_export_formats.py # Tests for COCO, YOLO, Pascal VOC exports
    └── ui/
-       └── __init__.py            # UI tests (TBD)
+       ├── __init__.py
+       └── test_video_ui.py       # Focused menu and event-routing tests
    ```
 
 3. **Pytest Configuration** ✓
@@ -89,7 +90,7 @@ pytest tests/unit -v
 # Integration tests only
 pytest tests/integration -v
 
-# UI tests only (when available)
+# Focused UI tests only
 pytest tests/ui -v
 ```
 
@@ -137,13 +138,58 @@ sessions without a display. The Linux runner needs the Qt 6 platform-plugin
 deps (`libxcb-cursor0`, `libegl1`, `libgl1`, etc. — see
 [`.github/workflows/tests.yml`](.github/workflows/tests.yml) for the full list).
 
+## Video Clip Manual Checklist
+
+Run this checklist when changing `video_clip.py`, `video_clip_dialog.py`,
+`video_sequence.py`, project persistence, or tracking initialization:
+
+1. Launch the app and create a project in a new empty folder.
+2. Use **Video > Open Video Clip...** on a normal MP4/AVI. Select frames
+   100-149 with stride 2 and verify that 25 frames appear.
+3. Verify the status bar shows clip position and the original source frame.
+   Use A/D to navigate and C to copy a selected polygon forward.
+4. Add a custom class, draw a polygon, correct it with Paint Brush/Eraser, and
+   verify annotations stay attached to the correct frame.
+5. Start a large extraction and press Cancel. Verify no partial clip appears
+   in the image list or project `images/` directory and the app remains usable.
+6. Import a second clip, then click frames from each clip. Verify A/D navigation
+   stays inside the selected frame's clip.
+7. Try to open another frame folder containing a filename already owned by the
+   first clip. Verify the app rejects it without changing the active session.
+   Repeat with a case-only variant such as `001.JPG` / `001.jpg`. An exact,
+   unowned project copy should instead be adopted without a duplicate entry.
+8. Add an unrelated ordinary image, initialize video tracking, and propagate a
+   reviewed polygon. Verify masks land only on the active clip's ordered frames.
+9. Save, close, and reopen the `.iap`. Repeat navigation for both clips and
+   verify annotations and source-frame numbers survive.
+10. Initialize tracking, remove a frame before the current frame, and initialize
+   tracking again. Verify the removed frame is absent and propagated masks stay
+   aligned with the remaining images. Repeat with the Delete key.
+11. Toggle dark mode and check the clip dialog and progress dialog for readable
+   text and native theme colors.
+12. Export COCO or YOLO and confirm the video frames use the same export path as
+    ordinary image annotations.
+13. Move brightness and contrast through their full ranges. Verify faint image
+    details change while annotation coordinates, source files, and SAM input do
+    not change. Reset both controls to zero.
+14. Apply both ER70S-6 presets. Verify the CAVITAR preset creates only molten
+    consumable and droplet, while the full preset creates all four classes with
+    the protocol RGB colors.
+15. Export RGB Semantic Masks. Inspect a labeled frame and an unlabeled frame;
+    verify exact palette values and an all-black background-only mask.
+16. Confirm RGB export rejects polygons from different classes that overlap.
+    Correct the overlap, select a fresh output directory, and export again.
+17. Attempt a second RGB export into the same directory. Confirm it is rejected
+    instead of mixing stale and current files.
+18. Import a video clip and verify extracted project frames are PNG files.
+
 ## Future Testing Work
 
-1. **Add UI Tests** (pytest-qt)
+1. **Expand UI Tests** (pytest-qt)
    - Test annotation creation workflows
    - Test project save/load
    - Test SAM integration
-   - Test video loading (Phase 2)
+   - Test progress-dialog cancellation timing with pytest-qt
 
 2. **Add Performance Tests**
    - Benchmark critical operations

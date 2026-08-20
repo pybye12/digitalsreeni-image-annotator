@@ -134,7 +134,7 @@ class ImageAnnotator:
 
     def save_project(self, show_message=True):
         if self.is_loading_project:
-            return  # Skip save during load
+            return False  # Skip save during load
         # ... normal save logic
 ```
 
@@ -434,6 +434,63 @@ being committed:
 Do not introduce a parallel `polygon` field or nested point arrays. Existing
 rendering, area calculation, project persistence, and exporters consume the
 flattened `segmentation` field.
+
+## Bounded-Memory Video Loading
+
+Normal videos must not be decoded into an in-memory Python list. Video import
+uses `cv2.VideoCapture` and holds only the current decoded frame while writing
+selected lossless PNG frames to the application cache. The worker then copies the clip
+to the project image directory before registration. The user controls the
+inclusive start/end range and stride before decoding begins. Both phases run
+on `VideoExtractionThread`; GUI widgets are updated only through Qt signals.
+
+There are three related frame identities:
+
+| Identity | Example | Purpose |
+|----------|---------|---------|
+| Clip index | `0` | Position used by A/D navigation and tracking APIs |
+| Source index | `1057` | Original zero-based frame number in the video |
+| Frame name | `weld_ab12_frame_000000000042.png` | Stable clip-position key used by `image_paths` and `all_annotations` |
+
+`FrameSequence` owns the active mapping. The optional `.iap` `video_sessions`
+field persists every clip, while old projects without that field continue to
+load normally. Both `FrameSequence` and `ImageAnnotator` build filename indexes
+when sequences or sessions change, avoiding full-frame scans during navigation.
+The index also enforces one clip-session owner per case-folded project filename,
+because a global annotation key cannot safely represent two different sequence
+contexts. Case-folding is applied on every platform so a project created on a
+case-sensitive filesystem cannot become ambiguous when moved to Windows.
+Generated names include a cache fingerprint so two different videos with the
+same basename cannot silently overwrite each other's annotations.
+
+Clip caches carry an application marker. Recursive cleanup requires both that
+marker and a resolved path strictly below the application's expected cache
+root. Runtime cache paths are never restored from `.iap` data. Cancellation,
+successful project copying, project clearing, and application close remove
+only directories satisfying both checks.
+
+SAM 3 never receives the project's shared `images/` directory. Before model
+initialization, the application builds a managed tracker workspace containing
+only the active clip's frames, named by zero-padded clip position. This keeps
+the model's integer output indices aligned with `FrameSequence` even when the
+project also contains unrelated images or other clips.
+
+Any membership or ordering change to the active sequence closes the current
+SAM 3 session before rebuilding `FrameSequence`. This prevents old model frame
+indices from being mapped through a newly shortened sequence.
+
+Project JSON uses a same-directory temporary file, file flush plus `fsync`, and
+`os.replace`. POSIX builds also attempt a parent-directory `fsync`; Windows uses
+same-volume atomic replacement. A mid-write failure leaves the previous `.iap`
+intact. Image copies are staged to temporary files in the destination directory
+and replaced atomically. Before committing, save builds a candidate image-path
+mapping and adopts an occupied destination only when a byte comparison confirms
+it is the same source image; a different same-named file aborts the save.
+`save_project()` catches filesystem and serialization errors, removes files
+created by the failed attempt, restores project identity and `image_paths`, and
+returns `False`. Callers such as Close Project and Save As must stop their
+workflow when that happens. Pending `Temp-*` review annotations are excluded
+from serialization without mutating the live review state.
 
 ## Export Format Filename Matching
 

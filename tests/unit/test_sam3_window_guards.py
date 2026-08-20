@@ -14,6 +14,9 @@ class BusyWindow:
     def show_warning(self, title, message):
         self.warnings.append((title, message))
 
+    def _reject_while_sam3_busy(self):
+        return ImageAnnotator._reject_while_sam3_busy(self)
+
 
 def test_open_specific_project_is_blocked_during_sam3_tracking():
     window = BusyWindow()
@@ -49,6 +52,14 @@ def test_remove_image_is_blocked_during_sam3_tracking():
     assert window.warnings
 
 
+def test_add_images_and_classes_are_blocked_during_sam3_tracking():
+    window = BusyWindow()
+
+    assert ImageAnnotator.add_images(window) is None
+    assert ImageAnnotator.add_class(window) is None
+    assert len(window.warnings) == 2
+
+
 def test_frame_folder_allows_exact_project_copy_but_rejects_name_collision(tmp_path):
     source = tmp_path / "source"
     project = tmp_path / "project"
@@ -65,6 +76,25 @@ def test_frame_folder_allows_exact_project_copy_but_rejects_name_collision(tmp_p
 
     (project / "001.png").write_bytes(b"different-frame")
     assert ImageAnnotator._sam3_frame_name_conflicts(window, sequence) == ["001.png"]
+
+    (project / "001.png").write_bytes(b"same-frame")
+    window._video_session_by_frame = {"001.png": "existing-clip"}
+    assert ImageAnnotator._sam3_frame_name_conflicts(window, sequence) == ["001.png"]
+
+
+def test_frame_folder_rejects_case_variant_project_identity(tmp_path):
+    source = tmp_path / "source"
+    project = tmp_path / "project"
+    source.mkdir()
+    project.mkdir()
+    (source / "001.jpg").write_bytes(b"same-frame")
+    (project / "001.JPG").write_bytes(b"same-frame")
+    sequence = FrameSequence.from_folder(source)
+    window = SimpleNamespace(image_paths={"001.JPG": str(project / "001.JPG")})
+
+    assert ImageAnnotator._sam3_frame_name_conflicts(window, sequence) == [
+        "001.jpg"
+    ]
 
 
 def test_rejected_rerun_clears_only_its_prior_generated_tracks():

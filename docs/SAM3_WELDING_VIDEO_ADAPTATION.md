@@ -65,8 +65,8 @@ derived from that exact mask, normalized to the frame, and sent through SAM
 3's supported visual-point prompt API. When the installed official Meta SAM 3
 build exposes its underlying tracker mask-prompt capability, the adapter then
 replaces the approximate point result with the exact source polygon mask before
-propagation. This keeps the track anchored to the large droplet the user
-selected instead of asking SAM 3 to choose among nearby bright welding regions.
+propagation. This keeps the track anchored to the exact object the user
+selected instead of asking SAM 3 to choose among nearby image regions.
 
 The public session request layer does not currently expose mask prompts, so
 mask seeding is feature-detected against the official model object. Builds
@@ -109,27 +109,33 @@ Using the existing schema preserves rendering, project saving, COCO export,
 and YOLO segmentation export.
 
 Before conversion, only the largest connected mask component is retained.
-Disconnected small components are treated as spatter and are never saved as
-additional droplets. The largest component is also rejected if it is smaller
-than 15% of the manually selected source droplet or fewer than 50 pixels.
+Disconnected small components are treated as tracking noise and are never
+saved as additional object regions. The largest component is also rejected if
+it is smaller than 15% of the manually selected source polygon or fewer than
+50 pixels. These geometric gates are class-agnostic; in the droplet workflow
+they also prevent small welding spatter from becoming droplet annotations.
 Masks that grow implausibly large compared with the source polygon or video
 frame are rejected as tracking drift.
 
 The prompt-frame result must overlap the manually selected source polygon. If
 it does not, propagation stops immediately and the UI reports that no tracking
 annotations were saved. This prevents a plausible-sized but unrelated bright
-feature from being mislabeled as the selected droplet.
+feature from being mislabeled as the selected object.
 
 ### Threading and lifecycle safety
 
 Model loading and propagation use the existing `_run_sync` worker-thread
-pattern. Qt continues processing events during inference, so state-changing
-project, frame, class, image, import, and annotation actions are blocked while
-SAM 3 is active.
+pattern. Qt continues processing events during inference, so the main editing
+window is disabled around each synchronous SAM 3 call. Queued project, frame,
+class, image, import, and canvas-editing events therefore cannot mutate state
+while model results are being produced. The application-wide DINO review filter
+also consumes Enter/Escape during this interval without accepting or rejecting
+pending predictions.
 
-Opening another frame folder invalidates the old session. Clearing or opening
-another project unloads the tracker. Exact project-local copies of source
-frames may be reopened; same-name files with different content are rejected.
+Selecting another persisted clip closes the active predictor session and its
+temporary tracker workspace; it does not delete the saved clip session.
+Clearing or opening another project unloads the tracker. A project image name
+can belong to only one persisted clip session.
 
 ### Windows fallback and unload
 
@@ -152,9 +158,10 @@ model objects to CPU, runs garbage collection, and clears the CUDA allocator.
    background point prompts, then uses the exact polygon as a tracker mask seed
    when supported by the installed official SAM 3 build.
 7. SAM 3 propagates object masks through later frames.
-8. Worker-side filtering retains only a droplet-sized main component, rejects
-   small spatter and implausible drift, then contour conversion produces one
-   compact polygon per tracked droplet.
+8. Worker-side filtering retains only the largest geometrically plausible main
+   component and rejects implausible drift. Contour conversion produces one
+   compact polygon per tracked object. For droplet labels, the same gate also
+   rejects small spatter.
 9. The application maps polygons back to filenames/classes and autosaves.
 
 The prompt frame is not overwritten. Repeating the same source-frame/source-ID
@@ -172,8 +179,8 @@ count immediately.
 
 Automated and integration verification completed during implementation:
 
-- Full pytest suite: 94 tests passed after the tracking/filtering changes.
-- Focused SAM 3 tracker suite: 16 tests passed after the source-overlap gate.
+- The full pytest suite passed after the tracking/filtering changes.
+- The focused SAM 3 tracker suite passed after the source-overlap gate.
 - Python `compileall` passed.
 - The real local SAM 3 checkpoint loaded on an NVIDIA RTX 3060 Laptop GPU.
 - A real 99-frame welding directory initialized successfully.

@@ -8,14 +8,26 @@ import pytest
 import sys
 import os
 import importlib.util
+import types
 from PyQt6.QtCore import QPoint, QSize
 from PyQt6.QtGui import QPixmap
 
-# Import image_label module directly by file path to avoid torch dependency issues
-image_label_path = os.path.join(os.path.dirname(__file__), '..', '..', 'src', 'digitalsreeni_image_annotator', 'image_label.py')
-spec = importlib.util.spec_from_file_location("image_label", image_label_path)
+# Import image_label directly while preserving package-relative imports and
+# avoiding the package __init__, which loads optional ML dependencies.
+package_name = "digitalsreeni_image_annotator"
+package_dir = os.path.join(
+    os.path.dirname(__file__), "..", "..", "src", package_name
+)
+if package_name not in sys.modules:
+    package = types.ModuleType(package_name)
+    package.__path__ = [os.path.abspath(package_dir)]
+    sys.modules[package_name] = package
+
+image_label_path = os.path.join(package_dir, "image_label.py")
+module_name = f"{package_name}.image_label"
+spec = importlib.util.spec_from_file_location(module_name, image_label_path)
 image_label = importlib.util.module_from_spec(spec)
-sys.modules['digitalsreeni_image_annotator.image_label'] = image_label
+sys.modules[module_name] = image_label
 spec.loader.exec_module(image_label)
 
 ImageLabel = image_label.ImageLabel

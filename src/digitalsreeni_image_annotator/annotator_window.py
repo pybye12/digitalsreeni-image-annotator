@@ -3,6 +3,7 @@ import filecmp
 import json
 import os
 import shutil
+import tempfile
 import traceback
 import uuid
 import warnings
@@ -13,7 +14,15 @@ import cv2
 import numpy as np
 import shapely
 from czifile import CziFile
-from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEvent,
+    QObject,
+    QStandardPaths,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -74,6 +83,7 @@ from .export_formats import (
     export_labeled_images,
     export_pascal_voc_bbox,
     export_pascal_voc_both,
+    export_rgb_semantic_masks,
     export_semantic_labels,
     export_yolo_v4,
     export_yolo_v5plus,
@@ -95,11 +105,93 @@ from .soft_dark_stylesheet import soft_dark_stylesheet
 from .stack_interpolator import StackInterpolator
 from .stack_to_slices import show_stack_to_slices
 from .utils import calculate_area, calculate_bbox
-from .yolo_trainer import LoadPredictionModelDialog, TrainingInfoDialog, YOLOTrainer
+from .video_clip import (
+    TRACKER_WORKSPACE_MARKER,
+    cleanup_managed_video_directory,
+    create_tracker_frame_workspace,
+    probe_video,
+    validate_video_source,
+    video_clip_cache_directory,
+)
+from .video_clip_dialog import VideoClipDialog, VideoExtractionThread
 from .video_sequence import FrameSequence
-from .welding_defaults import WELDING_CLASSES
+from .welding_defaults import (
+    ER70S6_CAVITAR_CLASSES,
+    ER70S6_CLASSES,
+    ER70S6_PROTOCOL,
+)
+from .yolo_trainer import LoadPredictionModelDialog, TrainingInfoDialog, YOLOTrainer
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def _canonical_image_name(name):
+    """Return a portable identity key for a project image filename."""
+    return os.path.basename(str(name)).casefold()
+
+
+def _write_json_atomically(file_path, data):
+    """Replace a project JSON file only after a complete durable temp write."""
+    destination = Path(file_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(data, temp_file, indent=2)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, destination)
+        if os.name != "nt":
+            directory_fd = None
+            try:
+                directory_fd = os.open(destination.parent, os.O_RDONLY)
+                os.fsync(directory_fd)
+            except OSError:
+                # Some filesystems do not support directory fsync. The atomic
+                # replacement still protects against partial JSON contents.
+                pass
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
+    except Exception:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError as cleanup_error:
+                print(f"Could not remove temporary project file {temp_path}: {cleanup_error}")
+        raise
+
+
+def _copy_file_atomically(source, destination):
+    """Copy a file through a same-directory temporary path."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+        shutil.copy2(source, temp_path)
+        os.replace(temp_path, destination)
+    except Exception:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError as cleanup_error:
+                print(f"Could not remove temporary image file {temp_path}: {cleanup_error}")
+        raise
 
 
 class TrainingThread(QThread):
@@ -187,6 +279,11 @@ class _DINOReviewEventFilter(QObject):
         focused = app.focusWidget()
         if isinstance(focused, (QLineEdit, QTextEdit)):
             return False
+        if (
+            self.main_window._sam3_inference_in_flight
+            or not self.main_window.isEnabled()
+        ):
+            return True
         temp = self.main_window.image_label.temp_annotations
         if not temp or not any(a.get("source") == "dino" for a in temp):
             return False
@@ -313,6 +410,11 @@ class ImageAnnotator(QMainWindow):
         self.setup_yolo_menu()
 
         self.frame_sequence = None
+        self.video_sessions = {}
+        self._video_session_by_frame = {}
+        self.active_video_session_id = None
+        self._sam3_frame_workspace = None
+        self._sam3_frame_workspace_root = None
         self.sam3_tracker = None
         self._sam3_inference_in_flight = False
 
@@ -384,7 +486,6 @@ class ImageAnnotator(QMainWindow):
         if self._sam3_inference_in_flight:
             self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
             return
-        self.remove_all_temp_annotations()  # Remove temp annotations from the previous project
         project_file, _ = QFileDialog.getSaveFileName(
             self, "Create New Project", "", "Image Annotator Project (*.iap)"
         )
@@ -393,29 +494,40 @@ class ImageAnnotator(QMainWindow):
             if not project_file.lower().endswith(".iap"):
                 project_file += ".iap"
 
-            self.current_project_file = project_file
-            self.current_project_dir = os.path.dirname(project_file)
-
-            # Create the images directory
-            images_dir = os.path.join(self.current_project_dir, "images")
-            os.makedirs(images_dir, exist_ok=True)
-
-            # Clear existing data without showing messages
-            self.clear_all(new_project=True, show_messages=False)
-
             # Prompt for initial project notes
             notes, ok = QInputDialog.getMultiLineText(
                 self, "Project Notes", "Enter initial project notes:"
             )
-            if ok:
-                self.project_notes = notes
-            else:
-                self.project_notes = ""
+            notes = notes if ok else ""
+            creation_date = datetime.now().isoformat()
+            project_dir = os.path.dirname(project_file)
+            try:
+                os.makedirs(os.path.join(project_dir, "images"), exist_ok=True)
+                _write_json_atomically(
+                    project_file,
+                    {
+                        "classes": [],
+                        "images": [],
+                        "image_paths": {},
+                        "notes": notes,
+                        "creation_date": creation_date,
+                        "last_modified": creation_date,
+                    },
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "New Project Failed",
+                    f"The new project could not be created:\n{exc}",
+                )
+                return
 
-            self.project_creation_date = datetime.now().isoformat()
-
-            # Save the empty project without showing a message
-            self.save_project(show_message=False)
+            # Replace the live state only after the empty project exists.
+            self.clear_all(new_project=True, show_messages=False)
+            self.current_project_file = project_file
+            self.current_project_dir = project_dir
+            self.project_notes = notes
+            self.project_creation_date = creation_date
 
             # Keep only this message
             self.show_info(
@@ -522,7 +634,15 @@ class ImageAnnotator(QMainWindow):
                 # user can switch rows freely afterwards.
                 if self.dino_class_table.rowCount() > 0:
                     self.dino_class_table.selectRow(0)
-                self.save_project(show_message=False)  # Save once after loading
+                normalized = self.save_project(show_message=False)
+                if not normalized:
+                    detail = getattr(self, "_last_project_save_error", None)
+                    QMessageBox.warning(
+                        self,
+                        "Project Opened Read-Only",
+                        "The project was opened, but its normalized state could "
+                        f"not be saved{f': {detail}' if detail else '.'}",
+                    )
 
                 self.initialize_yolo_trainer()
                 self.update_window_title()
@@ -545,6 +665,33 @@ class ImageAnnotator(QMainWindow):
 
     def load_project_data(self, project_data):
         """Load project data without triggering auto-saves."""
+        self._reset_sam3_video_state()
+        self._clear_video_sessions(clean_clip_caches=True)
+        loaded_sessions = copy.deepcopy(project_data.get("video_sessions", {}))
+        self.video_sessions = (
+            loaded_sessions if isinstance(loaded_sessions, dict) else {}
+        )
+        legacy_session = project_data.get("video_session")
+        if legacy_session and not self.video_sessions:
+            self.video_sessions["legacy"] = copy.deepcopy(legacy_session)
+        self.video_sessions = {
+            session_id: session
+            for session_id, session in self.video_sessions.items()
+            if isinstance(session, dict)
+        }
+        for session in self.video_sessions.values():
+            # Cache directories are process-local runtime state. Never trust a
+            # path supplied by a project file as a deletion target.
+            session.pop("cache_dir", None)
+        self.active_video_session_id = project_data.get(
+            "active_video_session_id"
+        )
+        if self.active_video_session_id not in self.video_sessions:
+            self.active_video_session_id = next(iter(self.video_sessions), None)
+        self._rebuild_video_session_frame_index()
+        if self.active_video_session_id not in self.video_sessions:
+            self.active_video_session_id = next(iter(self.video_sessions), None)
+
         # Load classes
         self.class_mapping.clear()
         self.image_label.class_colors.clear()
@@ -622,6 +769,8 @@ class ImageAnnotator(QMainWindow):
         if missing_images:
             self.handle_missing_images(missing_images)
 
+        self._restore_active_frame_sequence()
+
         # Select the first image if available
         if self.image_list.count() > 0:
             self.image_list.setCurrentRow(0)
@@ -674,6 +823,8 @@ class ImageAnnotator(QMainWindow):
                     self.all_annotations.pop(slice_name, None)
                 del self.image_slices[base_name]
 
+        self._prune_video_sessions_to_project_images()
+        self._restore_active_frame_sequence()
         self.update_ui()
         QMessageBox.information(
             self,
@@ -765,6 +916,8 @@ class ImageAnnotator(QMainWindow):
         if self._sam3_inference_in_flight:
             self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
             return
+        if not self.image_label.check_unsaved_changes():
+            return
         if hasattr(self, "current_project_file"):
             reply = QMessageBox.question(
                 self,
@@ -774,8 +927,15 @@ class ImageAnnotator(QMainWindow):
             )
 
             if reply == QMessageBox.StandardButton.Yes:
-                self.remove_all_temp_annotations()  # Remove temp annotations before saving
-                self.save_project(show_message=False)  # Save without showing a message
+                if not self.save_project(show_message=False):
+                    detail = getattr(self, "_last_project_save_error", None)
+                    QMessageBox.warning(
+                        self,
+                        "Close Cancelled",
+                        "The project could not be saved, so it was not closed"
+                        f"{f': {detail}' if detail else '.'}",
+                    )
+                    return
             elif reply == QMessageBox.StandardButton.Cancel:
                 return  # User cancelled the operation
 
@@ -839,12 +999,63 @@ class ImageAnnotator(QMainWindow):
             return obj
 
     def save_project(self, show_message=True):
+        if self.is_loading_project:
+            return False
+        self._last_project_save_error = None
+
+        had_project_file = hasattr(self, "current_project_file")
+        had_project_dir = hasattr(self, "current_project_dir")
+        original_project_file = getattr(self, "current_project_file", None)
+        original_project_dir = getattr(self, "current_project_dir", "")
+        original_image_paths = self.image_paths.copy()
+        created_destinations = []
+
+        try:
+            saved = self._save_project_impl(
+                show_message,
+                created_destinations,
+            )
+        except Exception as exc:
+            self._last_project_save_error = str(exc)
+            print(f"Failed to save project: {exc}")
+            if show_message:
+                QMessageBox.critical(
+                    self,
+                    "Project Save Failed",
+                    f"The project could not be saved:\n{exc}",
+                )
+            saved = False
+
+        if not saved:
+            try:
+                for destination in reversed(created_destinations):
+                    try:
+                        Path(destination).unlink()
+                    except OSError as cleanup_error:
+                        print(
+                            "Could not remove an incomplete project image "
+                            f"{destination}: {cleanup_error}"
+                        )
+            finally:
+                self.image_paths = original_image_paths
+                if had_project_file:
+                    self.current_project_file = original_project_file
+                elif hasattr(self, "current_project_file"):
+                    del self.current_project_file
+                if had_project_dir:
+                    self.current_project_dir = original_project_dir
+                elif hasattr(self, "current_project_dir"):
+                    del self.current_project_dir
+        return saved
+
+    def _save_project_impl(self, show_message, created_destinations):
+
         if not hasattr(self, "current_project_file") or not self.current_project_file:
             self.current_project_file, _ = QFileDialog.getSaveFileName(
                 self, "Save Project", "", "Image Annotator Project (*.iap)"
             )
             if not self.current_project_file:
-                return  # User cancelled the save dialog
+                return False
 
         self.current_project_dir = os.path.dirname(self.current_project_file)
 
@@ -853,11 +1064,37 @@ class ImageAnnotator(QMainWindow):
         os.makedirs(images_dir, exist_ok=True)
 
         images_to_copy = []
+        candidate_image_paths = {}
+        destination_names = {}
         for file_name, src_path in self.image_paths.items():
             dst_path = os.path.join(images_dir, file_name)
-            if os.path.abspath(src_path) != os.path.abspath(dst_path):
-                if not os.path.exists(dst_path):
-                    images_to_copy.append((file_name, src_path, dst_path))
+            destination_key = _canonical_image_name(file_name)
+            previous_name = destination_names.get(destination_key)
+            if previous_name is not None and previous_name != file_name:
+                raise ValueError(
+                    "The project contains image names that collide on this "
+                    f"filesystem: {previous_name} and {file_name}."
+                )
+            destination_names[destination_key] = file_name
+            candidate_image_paths[file_name] = dst_path
+
+            if os.path.abspath(src_path) == os.path.abspath(dst_path):
+                continue
+            if os.path.exists(dst_path):
+                try:
+                    same_image = filecmp.cmp(src_path, dst_path, shallow=False)
+                except OSError as exc:
+                    raise OSError(
+                        f"Could not verify existing project image {dst_path}: {exc}"
+                    ) from exc
+                if not same_image:
+                    raise FileExistsError(
+                        "The destination already contains a different image named "
+                        f"{file_name}. Choose another project folder or remove the "
+                        "conflicting file."
+                    )
+                continue
+            images_to_copy.append((file_name, src_path, dst_path))
 
         if images_to_copy:
             reply = QMessageBox.question(
@@ -872,21 +1109,16 @@ class ImageAnnotator(QMainWindow):
 
             if reply == QMessageBox.StandardButton.Yes:
                 for file_name, src_path, dst_path in images_to_copy:
-                    try:
-                        shutil.copy2(src_path, dst_path)
-                        self.image_paths[file_name] = dst_path
-                    except Exception as e:
-                        QMessageBox.warning(
-                            self, "Copy Failed", f"Failed to copy {file_name}: {str(e)}"
-                        )
-                        return
+                    created_destinations.append(Path(dst_path))
+                    _copy_file_atomically(src_path, dst_path)
             else:
+                self._last_project_save_error = "Project image copy was declined."
                 QMessageBox.warning(
                     self,
                     "Save Cancelled",
                     "Project cannot be saved without the correct directory structure.",
                 )
-                return
+                return False
 
         # Prepare image data
         images_data = []
@@ -922,6 +1154,8 @@ class ImageAnnotator(QMainWindow):
                 for class_name, annotations in self.all_annotations.get(
                     file_name, {}
                 ).items():
+                    if class_name.startswith("Temp-"):
+                        continue
                     image_data["annotations"][class_name] = [
                         ann.copy() for ann in annotations
                     ]
@@ -933,10 +1167,13 @@ class ImageAnnotator(QMainWindow):
             "classes": [
                 {"name": name, "color": color.name()}
                 for name, color in self.image_label.class_colors.items()
+                if not name.startswith("Temp-")
             ],
             "images": images_data,
             "image_paths": {
-                k: v for k, v in self.image_paths.items() if os.path.exists(v)
+                k: v
+                for k, v in candidate_image_paths.items()
+                if os.path.exists(v)
             },
             "notes": getattr(self, "project_notes", ""),
             "creation_date": getattr(
@@ -953,21 +1190,34 @@ class ImageAnnotator(QMainWindow):
         if dino_cfg["phrases"] or dino_cfg["thresholds"]:
             project_data["dino_config"] = dino_cfg
 
-        # Save project data
-        with open(self.current_project_file, "w") as f:
-            json.dump(self.convert_to_serializable(project_data), f, indent=2)
+        video_sessions = self._video_sessions_for_save()
+        if video_sessions:
+            project_data["video_sessions"] = video_sessions
+            if self.active_video_session_id in video_sessions:
+                project_data["active_video_session_id"] = (
+                    self.active_video_session_id
+                )
 
-        if show_message:
-            self.show_info(
-                "Project Saved", f"Project saved to {self.current_project_file}"
-            )
+        # Replace the live project only after a complete same-directory write.
+        _write_json_atomically(
+            self.current_project_file,
+            self.convert_to_serializable(project_data),
+        )
+        self.image_paths = candidate_image_paths
 
-        # Update the window title
-        self.update_window_title()
-
-        # Update image_paths to reflect the correct locations
-        for file_name in self.image_paths.keys():
-            self.image_paths[file_name] = os.path.join(images_dir, file_name)
+        # The disk and required in-memory commit are complete. Failures in
+        # optional UI/cache refresh must not be reported as a failed commit.
+        try:
+            if show_message:
+                self.show_info(
+                    "Project Saved", f"Project saved to {self.current_project_file}"
+                )
+            self.update_window_title()
+            self._cleanup_video_clip_caches()
+            self._restore_active_frame_sequence()
+        except Exception as exc:
+            print(f"Project saved, but post-save refresh failed: {exc}")
+        return True
 
     def save_project_as(self):
         new_project_file, _ = QFileDialog.getSaveFileName(
@@ -978,15 +1228,42 @@ class ImageAnnotator(QMainWindow):
             if not new_project_file.lower().endswith(".iap"):
                 new_project_file += ".iap"
 
-            # Store the original project file
+            # Store the original project identity. A failed Save As must not
+            # leave the live window pointing at an uncommitted destination.
+            had_project_file = hasattr(self, "current_project_file")
+            had_project_dir = hasattr(self, "current_project_dir")
             original_project_file = getattr(self, "current_project_file", None)
+            original_project_dir = getattr(self, "current_project_dir", "")
+            original_image_paths = self.image_paths.copy()
+            committed = False
+            failure_detail = None
 
-            # Set the new project file as the current one
-            self.current_project_file = new_project_file
-            self.current_project_dir = os.path.dirname(new_project_file)
+            try:
+                self.current_project_file = new_project_file
+                self.current_project_dir = os.path.dirname(new_project_file)
+                committed = self.save_project(show_message=False)
+                if not committed:
+                    failure_detail = getattr(self, "_last_project_save_error", None)
+            finally:
+                if not committed:
+                    if had_project_file:
+                        self.current_project_file = original_project_file
+                    elif hasattr(self, "current_project_file"):
+                        del self.current_project_file
+                    if had_project_dir:
+                        self.current_project_dir = original_project_dir
+                    elif hasattr(self, "current_project_dir"):
+                        del self.current_project_dir
+                    self.image_paths = original_image_paths
 
-            # Save the project with the new name
-            self.save_project(show_message=False)
+            if not committed:
+                QMessageBox.critical(
+                    self,
+                    "Save As Failed",
+                    "The project could not be saved to the selected location"
+                    f"{f': {failure_detail}' if failure_detail else '.'}",
+                )
+                return
 
             # Update the window title
             self.update_window_title()
@@ -1002,7 +1279,7 @@ class ImageAnnotator(QMainWindow):
 
     def auto_save(self):
         if self.is_loading_project:
-            return  # Skip auto-save during project loading
+            return False
 
         if not hasattr(self, "current_project_file"):
             reply = QMessageBox.question(
@@ -1013,13 +1290,19 @@ class ImageAnnotator(QMainWindow):
                 QMessageBox.StandardButton.Yes,
             )
             if reply == QMessageBox.StandardButton.Yes:
-                self.save_project()
+                saved = self.save_project()
+                if saved:
+                    print("Project auto-saved.")
+                return saved
             else:
-                return
+                return False
 
         if hasattr(self, "current_project_file"):
-            self.save_project(show_message=False)
-            print("Project auto-saved.")
+            saved = self.save_project(show_message=False)
+            if saved:
+                print("Project auto-saved.")
+            return saved
+        return False
 
     def show_project_details(self):
         if not hasattr(self, "current_project_file"):
@@ -1039,11 +1322,21 @@ class ImageAnnotator(QMainWindow):
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
             if dialog.were_changes_made():
+                previous_notes = getattr(self, "project_notes", "")
                 self.project_notes = dialog.get_notes()
-                self.save_project(show_message=False)
-                QMessageBox.information(
-                    self, "Project Details", "Project details have been updated."
-                )
+                if self.save_project(show_message=False):
+                    QMessageBox.information(
+                        self, "Project Details", "Project details have been updated."
+                    )
+                else:
+                    self.project_notes = previous_notes
+                    detail = getattr(self, "_last_project_save_error", None)
+                    QMessageBox.warning(
+                        self,
+                        "Project Details Not Saved",
+                        "The project details were not updated"
+                        f"{f': {detail}' if detail else '.'}",
+                    )
             else:
                 print("No changes made to project details.")
 
@@ -1311,11 +1604,16 @@ class ImageAnnotator(QMainWindow):
 
         raise ValueError(f"Unsupported image shape: {image_array.shape}")
 
-    def add_images_to_list(self, file_names):
+    def add_images_to_list(self, file_names, known_size=None, auto_save=True):
         first_added_item = None
+        added_names = []
+        existing_names = {
+            _canonical_image_name(name): name for name in self.image_paths
+        }
         for file_name in file_names:
             base_name = os.path.basename(file_name)
-            if base_name not in self.image_paths:
+            image_key = _canonical_image_name(base_name)
+            if image_key not in existing_names:
                 image_info = {
                     "file_name": base_name,
                     "height": 0,
@@ -1346,11 +1644,15 @@ class ImageAnnotator(QMainWindow):
                         )
                 else:
                     # For regular images
-                    image = QImage(file_name)
-                    image_info["height"] = image.height()
-                    image_info["width"] = image.width()
+                    if known_size:
+                        image_info["width"], image_info["height"] = known_size
+                    else:
+                        image = QImage(file_name)
+                        image_info["height"] = image.height()
+                        image_info["width"] = image.width()
 
                 self.all_images.append(image_info)
+                added_names.append(base_name)
                 item = QListWidgetItem(base_name)
                 self.image_list.addItem(item)
                 if first_added_item is None:
@@ -1358,13 +1660,15 @@ class ImageAnnotator(QMainWindow):
 
                 # Update image_paths with the original file path
                 self.image_paths[base_name] = file_name
+                existing_names[image_key] = base_name
 
         if first_added_item:
             self.image_list.setCurrentItem(first_added_item)
             self.switch_image(first_added_item)
 
-        if not self.is_loading_project:
+        if auto_save and not self.is_loading_project:
             self.auto_save()
+        return added_names
 
     def update_all_images(self, new_image_info):
         for info in new_image_info:
@@ -1401,7 +1705,8 @@ class ImageAnnotator(QMainWindow):
                 event.ignore()
                 return
 
-        # Perform any other cleanup or saving operations here
+        self._reset_sam3_video_state(unload=True)
+        self._clear_video_sessions(clean_clip_caches=True)
         event.accept()
 
     def switch_slice(self, item):
@@ -1492,6 +1797,7 @@ class ImageAnnotator(QMainWindow):
 
         if image_info:
             self.image_file_name = file_name
+            self._activate_video_session_for_frame(file_name)
             image_path = self.image_paths.get(file_name)
 
             if not image_path:
@@ -2249,6 +2555,7 @@ class ImageAnnotator(QMainWindow):
             "YOLO (v5+)",
             "Labeled Images",
             "Semantic Labels",
+            "RGB Semantic Masks",
             "Pascal VOC (BBox)",
             "Pascal VOC (BBox + Segmentation)",
         ]
@@ -2341,6 +2648,26 @@ class ImageAnnotator(QMainWindow):
             )
             message = f"Semantic labels have been exported successfully.\nSemantic Labels: {semantic_labels_dir}\n"
             message += f"A class-pixel mapping has been saved in: {os.path.join(semantic_labels_dir, 'class_pixel_mapping.txt')}"
+
+        elif export_format == "RGB Semantic Masks":
+            try:
+                rgb_masks_dir = export_rgb_semantic_masks(
+                    self.all_annotations,
+                    self.image_label.class_colors,
+                    self.image_paths,
+                    self.slices,
+                    self.image_slices,
+                    file_name,
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "RGB Mask Export", str(exc))
+                return
+            message = (
+                "RGB semantic masks have been exported successfully.\n"
+                f"Output: {rgb_masks_dir}\n"
+                "Unlabeled pixels are black; class pixels use the configured "
+                "class colors."
+            )
 
         elif export_format == "Pascal VOC (BBox)":
             voc_dir = export_pascal_voc_bbox(
@@ -2604,6 +2931,10 @@ class ImageAnnotator(QMainWindow):
 
         # Video Menu
         video_menu = menu_bar.addMenu("&Video")
+        open_video_action = QAction("Open Video &Clip...", self)
+        open_video_action.triggered.connect(self.open_video_clip)
+        video_menu.addAction(open_video_action)
+
         open_folder_action = QAction("Open Frame &Folder...", self)
         open_folder_action.triggered.connect(self.open_frame_folder)
         video_menu.addAction(open_folder_action)
@@ -2622,9 +2953,18 @@ class ImageAnnotator(QMainWindow):
 
         # Welding Menu
         welding_menu = menu_bar.addMenu("&Welding")
-        add_welding_action = QAction("Add &Default Welding Classes", self)
+        add_welding_action = QAction("Add ER70S-6 &Full Arc Classes", self)
         add_welding_action.triggered.connect(self.add_default_welding_classes)
         welding_menu.addAction(add_welding_action)
+
+        add_cavitar_action = QAction("Add ER70S-6 &CAVITAR Classes", self)
+        add_cavitar_action.triggered.connect(self.add_cavitar_welding_classes)
+        welding_menu.addAction(add_cavitar_action)
+
+        welding_menu.addSeparator()
+        protocol_action = QAction("Show ER70S-6 Labeling &Protocol", self)
+        protocol_action.triggered.connect(self.show_er70s6_protocol)
+        welding_menu.addAction(protocol_action)
 
         # Project Menu
         project_menu = menu_bar.addMenu("&Project")
@@ -2815,6 +3155,37 @@ class ImageAnnotator(QMainWindow):
         self.class_list.customContextMenuRequested.connect(self.show_class_context_menu)
         self.class_list.itemClicked.connect(self.on_class_selected)
         self.sidebar_layout.addWidget(self.class_list)
+
+        self.sidebar_layout.addWidget(create_section_header("Display Adjustments"))
+        display_widget = QWidget()
+        display_layout = QGridLayout(display_widget)
+        display_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.brightness_value_label = QLabel("0")
+        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setRange(-100, 100)
+        self.brightness_slider.setValue(0)
+        self.brightness_slider.valueChanged.connect(self.update_display_adjustments)
+        display_layout.addWidget(QLabel("Brightness"), 0, 0)
+        display_layout.addWidget(self.brightness_slider, 0, 1)
+        display_layout.addWidget(self.brightness_value_label, 0, 2)
+
+        self.contrast_value_label = QLabel("0")
+        self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self.contrast_slider.setRange(-100, 100)
+        self.contrast_slider.setValue(0)
+        self.contrast_slider.valueChanged.connect(self.update_display_adjustments)
+        display_layout.addWidget(QLabel("Contrast"), 1, 0)
+        display_layout.addWidget(self.contrast_slider, 1, 1)
+        display_layout.addWidget(self.contrast_value_label, 1, 2)
+
+        reset_display_button = QPushButton("Reset Display")
+        reset_display_button.clicked.connect(self.reset_display_adjustments)
+        display_layout.addWidget(reset_display_button, 2, 0, 1, 3)
+        display_note = QLabel("Preview only; source images and exports are unchanged.")
+        display_note.setWordWrap(True)
+        display_layout.addWidget(display_note, 3, 0, 1, 3)
+        self.sidebar_layout.addWidget(display_widget)
 
         # Annotation section
         self.sidebar_layout.addWidget(create_section_header("Annotation"))
@@ -3035,6 +3406,7 @@ class ImageAnnotator(QMainWindow):
         self.export_format_selector.addItem("YOLO (v5+)")  # New format
         self.export_format_selector.addItem("Labeled Images")
         self.export_format_selector.addItem("Semantic Labels")
+        self.export_format_selector.addItem("RGB Semantic Masks")
         self.export_format_selector.addItem("Pascal VOC (BBox)")
         self.export_format_selector.addItem("Pascal VOC (BBox + Segmentation)")
 
@@ -3044,6 +3416,18 @@ class ImageAnnotator(QMainWindow):
         self.export_button = QPushButton("Export Annotations")
         self.export_button.clicked.connect(self.export_annotations)
         self.sidebar_layout.addWidget(self.export_button)
+
+    def update_display_adjustments(self):
+        brightness = self.brightness_slider.value()
+        contrast = self.contrast_slider.value()
+        self.brightness_value_label.setText(f"{brightness:+d}")
+        self.contrast_value_label.setText(f"{contrast:+d}")
+        self.image_label.set_display_adjustments(brightness, contrast)
+
+    def reset_display_adjustments(self):
+        self.brightness_slider.setValue(0)
+        self.contrast_slider.setValue(0)
+        self.update_display_adjustments()
 
     def toggle_sam_box(self):
         if self.sam_box_button.isChecked():
@@ -3952,6 +4336,8 @@ class ImageAnnotator(QMainWindow):
         self.help_window.show_centered(self)
 
     def add_images(self):
+        if self._reject_while_sam3_busy():
+            return
         if not self.image_label.check_unsaved_changes():
             return
         file_names, _ = QFileDialog.getOpenFileNames(
@@ -3973,6 +4359,7 @@ class ImageAnnotator(QMainWindow):
                 return
 
         self._reset_sam3_video_state(unload=True)
+        self._clear_video_sessions(clean_clip_caches=True)
 
         # Clear images
         self.image_list.clear()
@@ -4063,6 +4450,15 @@ class ImageAnnotator(QMainWindow):
         self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
         return True
 
+    def _run_sam3_ui_locked(self, operation, *args):
+        """Run synchronous SAM work without allowing nested UI mutations."""
+        was_enabled = self.isEnabled()
+        self.setEnabled(False)
+        try:
+            return _run_sync(operation, *args)
+        finally:
+            self.setEnabled(was_enabled)
+
     def show_info(self, title, message):
         QMessageBox.information(self, title, message)
 
@@ -4071,6 +4467,15 @@ class ImageAnnotator(QMainWindow):
             width = self.current_image.width()
             height = self.current_image.height()
             info = f"Image: {width}x{height}"
+            if self.frame_sequence:
+                frame = self.frame_sequence.frame_for_name(self.image_file_name)
+                if frame:
+                    clip_position = (
+                        f"{frame.index + 1}/{len(self.frame_sequence.frames)}"
+                    )
+                    info += f", clip frame {clip_position}"
+                    if frame.source_index is not None:
+                        info += f", source frame {frame.source_index}"
             if additional_info:
                 info += f", {additional_info}"
             self.image_info_label.setText(info)
@@ -4211,55 +4616,53 @@ class ImageAnnotator(QMainWindow):
         if self._reject_while_sam3_busy():
             return
         current_item = self.image_list.currentItem()
-        if current_item:
-            file_name = current_item.text()
+        if current_item and self._remove_image_item(current_item):
+            self.auto_save()
 
-            # Remove from all data structures
-            self.image_list.takeItem(self.image_list.row(current_item))
-            self.image_paths.pop(file_name, None)
-            self.all_images = [
-                img for img in self.all_images if img["file_name"] != file_name
-            ]
+    def _remove_image_item(self, item, select_next=True):
+        """Remove one image through the shared project/video state transition."""
+        if item is None:
+            return None
 
-            # Remove annotations
-            self.all_annotations.pop(file_name, None)
+        file_name = item.text()
+        self.image_list.takeItem(self.image_list.row(item))
+        self.image_paths.pop(file_name, None)
+        self.all_images = [
+            image
+            for image in self.all_images
+            if image["file_name"] != file_name
+        ]
+        self.all_annotations.pop(file_name, None)
+        self._remove_frame_from_video_sessions(file_name)
 
-            # Handle multi-dimensional images
-            base_name = os.path.splitext(file_name)[0]
-            if base_name in self.image_slices:
-                # Remove slices
-                for slice_name, _ in self.image_slices[base_name]:
-                    self.all_annotations.pop(slice_name, None)
-                del self.image_slices[base_name]
+        base_name = os.path.splitext(file_name)[0]
+        if base_name in self.image_slices:
+            for slice_name, _ in self.image_slices[base_name]:
+                self.all_annotations.pop(slice_name, None)
+            del self.image_slices[base_name]
+            self.slice_list.clear()
 
-                # Clear slice list
-                self.slice_list.clear()
+        if self.image_file_name == file_name:
+            self.current_image = None
+            self.image_file_name = ""
+            self.current_slice = None
+            self.image_label.clear()
+            self.annotation_list.clear()
 
-            # Clear current image and slice if it was the removed image
-            if self.image_file_name == file_name:
-                self.current_image = None
-                self.image_file_name = ""
-                self.current_slice = None
-                self.image_label.clear()
-                self.annotation_list.clear()
+        if select_next and self.image_list.count() > 0:
+            next_item = self.image_list.item(0)
+            self.image_list.setCurrentItem(next_item)
+            self.switch_image(next_item)
+        elif self.image_list.count() == 0:
+            self.current_image = None
+            self.image_file_name = ""
+            self.current_slice = None
+            self.image_label.clear()
+            self.annotation_list.clear()
+            self.slice_list.clear()
 
-            # Switch to another image if available
-            if self.image_list.count() > 0:
-                next_item = self.image_list.item(0)
-                self.image_list.setCurrentItem(next_item)
-                self.switch_image(next_item)
-            else:
-                # No images left
-                self.current_image = None
-                self.image_file_name = ""
-                self.current_slice = None
-                self.image_label.clear()
-                self.annotation_list.clear()
-                self.slice_list.clear()
-
-            # Update UI
-            self.update_ui()
-            self.auto_save()  # Auto-save after removing an image
+        self.update_ui()
+        return file_name
 
     def load_annotations(self):
         if self._reject_while_sam3_busy():
@@ -4624,55 +5027,14 @@ class ImageAnnotator(QMainWindow):
             )
 
             if reply == QMessageBox.StandardButton.Yes:
-                # Remove from all data structures
-                self.image_list.takeItem(self.image_list.row(current_item))
-                self.image_paths.pop(file_name, None)
-                self.all_images = [
-                    img for img in self.all_images if img["file_name"] != file_name
-                ]
-
-                # Remove annotations
-                self.all_annotations.pop(file_name, None)
-
-                # Handle multi-dimensional images
-                base_name = os.path.splitext(file_name)[0]
-                if base_name in self.image_slices:
-                    # Remove slices
-                    for slice_name, _ in self.image_slices[base_name]:
-                        self.all_annotations.pop(slice_name, None)
-                    del self.image_slices[base_name]
-
-                    # Clear slice list
-                    self.slice_list.clear()
-
-                # Clear current image and slice if it was the removed image
-                if self.image_file_name == file_name:
-                    self.current_image = None
-                    self.image_file_name = ""
-                    self.current_slice = None
-                    self.image_label.clear()
-                    self.annotation_list.clear()
-
-                # Switch to another image if available
-                if self.image_list.count() > 0:
-                    next_item = self.image_list.item(0)
-                    self.image_list.setCurrentItem(next_item)
-                    self.switch_image(next_item)
-                else:
-                    # No images left
-                    self.current_image = None
-                    self.image_file_name = ""
-                    self.current_slice = None
-                    self.image_label.clear()
-                    self.annotation_list.clear()
-                    self.slice_list.clear()
-
-                # Update UI
-                self.update_ui()
-
-                QMessageBox.information(
-                    self, "Image Deleted", f"The image '{file_name}' has been deleted."
-                )
+                removed_name = self._remove_image_item(current_item)
+                if removed_name:
+                    self.auto_save()
+                    QMessageBox.information(
+                        self,
+                        "Image Deleted",
+                        f"The image '{file_name}' has been deleted.",
+                    )
 
     def display_image(self):
         if self.current_image:
@@ -4702,6 +5064,8 @@ class ImageAnnotator(QMainWindow):
         self.update_image_info()
 
     def add_class(self, class_name=None, color=None):
+        if self._reject_while_sam3_busy():
+            return
         if not self.image_label.check_unsaved_changes():
             return
 
@@ -6027,11 +6391,61 @@ class ImageAnnotator(QMainWindow):
             return False
         return True
 
+    def _apply_welding_class_preset(self, classes, title):
+        if self._reject_while_sam3_busy():
+            return
+        if not self.image_label.check_unsaved_changes():
+            return
+
+        added = 0
+        updated = 0
+        for class_name, color in classes:
+            if class_name in self.class_mapping:
+                current = self.image_label.class_colors.get(class_name)
+                if current is None or current.rgba() != color.rgba():
+                    self.image_label.class_colors[class_name] = QColor(color)
+                    updated += 1
+            else:
+                self.add_class(class_name, QColor(color))
+                added += 1
+
+        self.update_class_list()
+        self.update_annotation_list()
+        self.image_label.update()
+        self.auto_save()
+        self.show_info(
+            title,
+            f"Preset ready: {added} class(es) added and {updated} color(s) updated.",
+        )
+
     def add_default_welding_classes(self):
-        for class_name, color in WELDING_CLASSES:
-            if class_name not in self.class_mapping:
-                self.add_class(class_name, color)
-        self.show_info("Welding Classes", "Added default welding classes.")
+        self._apply_welding_class_preset(
+            ER70S6_CLASSES,
+            "ER70S-6 Full Arc Classes",
+        )
+
+    def add_cavitar_welding_classes(self):
+        self._apply_welding_class_preset(
+            ER70S6_CAVITAR_CLASSES,
+            "ER70S-6 CAVITAR Classes",
+        )
+
+    def show_er70s6_protocol(self):
+        QMessageBox.information(self, "ER70S-6 Labeling Protocol", ER70S6_PROTOCOL)
+
+    def _application_cache_root(self):
+        cache_root = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.CacheLocation
+        )
+        if not cache_root:
+            cache_root = os.path.join(os.getcwd(), ".video_cache")
+        return Path(cache_root)
+
+    def _video_clip_cache_root(self):
+        return self._application_cache_root() / "video_clips"
+
+    def _sam3_tracker_cache_root(self):
+        return self._application_cache_root() / "tracker_sessions"
 
     def _reset_sam3_video_state(self, unload=False):
         if self.sam3_tracker is not None:
@@ -6040,12 +6454,205 @@ class ImageAnnotator(QMainWindow):
                 self.sam3_tracker = None
             else:
                 self.sam3_tracker.close_session()
+        self._clear_sam3_frame_workspace()
         self.frame_sequence = None
+        self.active_video_session_id = None
+
+    def _clear_sam3_frame_workspace(self):
+        if self._sam3_frame_workspace:
+            cleanup_managed_video_directory(
+                self._sam3_frame_workspace,
+                self._sam3_frame_workspace_root,
+                TRACKER_WORKSPACE_MARKER,
+            )
+            self._sam3_frame_workspace = None
+            self._sam3_frame_workspace_root = None
+
+    def _clear_video_sessions(self, clean_clip_caches=False):
+        if clean_clip_caches:
+            self._cleanup_video_clip_caches()
+        self.video_sessions = {}
+        self._video_session_by_frame = {}
+        self.active_video_session_id = None
+
+    def _rebuild_video_session_frame_index(self):
+        frame_owners = {}
+        empty_sessions = []
+        for session_id, session in self.video_sessions.items():
+            owned_frames = []
+            for frame in session.get("frames", []):
+                name = frame.get("name")
+                frame_key = _canonical_image_name(name) if name else ""
+                if not frame_key or frame_key in frame_owners:
+                    continue
+                frame_owners[frame_key] = session_id
+                owned_frames.append(frame)
+            session["frames"] = owned_frames
+            if not owned_frames:
+                empty_sessions.append(session_id)
+        for session_id in empty_sessions:
+            self.video_sessions.pop(session_id, None)
+        self._video_session_by_frame = frame_owners
+
+    def _prune_video_sessions_to_project_images(self):
+        """Drop every persisted frame that no longer exists in the project."""
+        project_names = {
+            _canonical_image_name(name): name
+            for name, path in self.image_paths.items()
+            if path and os.path.exists(path)
+        }
+        for session in self.video_sessions.values():
+            kept_frames = []
+            for frame in session.get("frames", []):
+                project_name = project_names.get(
+                    _canonical_image_name(frame.get("name", ""))
+                )
+                if not project_name:
+                    continue
+                kept_frames.append({**frame, "name": project_name})
+            session["frames"] = kept_frames
+        self._rebuild_video_session_frame_index()
+        if self.active_video_session_id not in self.video_sessions:
+            self.active_video_session_id = next(iter(self.video_sessions), None)
+
+    def _video_sessions_for_save(self):
+        project_frame_keys = {
+            _canonical_image_name(name)
+            for name, path in self.image_paths.items()
+            if path and os.path.exists(path)
+        }
+        saved_sessions = {}
+        for session_id, source_session in self.video_sessions.items():
+            session = copy.deepcopy(source_session)
+            session.pop("cache_dir", None)
+            session["frames"] = [
+                frame
+                for frame in session.get("frames", [])
+                if _canonical_image_name(frame.get("name", ""))
+                in project_frame_keys
+            ]
+            if session["frames"]:
+                saved_sessions[session_id] = session
+        return saved_sessions
+
+    def _restore_active_frame_sequence(self):
+        self.frame_sequence = None
+        ImageAnnotator._prune_video_sessions_to_project_images(self)
+        session = self.video_sessions.get(self.active_video_session_id)
+        if not session:
+            self.active_video_session_id = None
+            self._rebuild_video_session_frame_index()
+            return
+
+        project_names = {
+            _canonical_image_name(name): name for name in self.image_paths
+        }
+        frame_paths = []
+        source_indices = []
+        kept_frames = []
+        for frame_data in session.get("frames", []):
+            name = frame_data.get("name")
+            project_name = project_names.get(_canonical_image_name(name or ""))
+            path = self.image_paths.get(project_name) if project_name else None
+            if not name or not path or not os.path.exists(path):
+                continue
+            if project_name != name:
+                frame_data = {**frame_data, "name": project_name}
+            frame_paths.append(path)
+            source_indices.append(frame_data.get("source_index"))
+            kept_frames.append(frame_data)
+
+        session["frames"] = kept_frames
+        if not frame_paths:
+            self._rebuild_video_session_frame_index()
+            if self.active_video_session_id not in self.video_sessions:
+                self.active_video_session_id = next(iter(self.video_sessions), None)
+                if self.active_video_session_id:
+                    self._restore_active_frame_sequence()
+            return
+
+        self.frame_sequence = FrameSequence.from_paths(
+            Path(frame_paths[0]).parent,
+            frame_paths,
+            source_indices,
+        )
+        self._rebuild_video_session_frame_index()
+        if self.active_video_session_id not in self.video_sessions:
+            self.active_video_session_id = next(iter(self.video_sessions), None)
+            self._restore_active_frame_sequence()
+
+    def _activate_video_session_for_frame(self, frame_name):
+        matching_session_id = self._video_session_by_frame.get(
+            _canonical_image_name(frame_name)
+        )
+        if not matching_session_id:
+            return
+        if matching_session_id != self.active_video_session_id:
+            self._reset_sam3_video_state()
+            self.active_video_session_id = matching_session_id
+        if self.frame_sequence is None:
+            self._restore_active_frame_sequence()
+
+    def _remove_frame_from_video_sessions(self, frame_name):
+        frame_key = _canonical_image_name(frame_name)
+        active_session_id = self.active_video_session_id
+        active_session = self.video_sessions.get(active_session_id, {})
+        active_sequence_changed = any(
+            _canonical_image_name(frame.get("name", "")) == frame_key
+            for frame in active_session.get("frames", [])
+        )
+        if active_sequence_changed:
+            self._reset_sam3_video_state()
+
+        empty_sessions = []
+        for session_id, session in self.video_sessions.items():
+            session["frames"] = [
+                frame
+                for frame in session.get("frames", [])
+                if _canonical_image_name(frame.get("name", "")) != frame_key
+            ]
+            if not session["frames"]:
+                empty_sessions.append(session_id)
+        for session_id in empty_sessions:
+            self.video_sessions.pop(session_id, None)
+        self._rebuild_video_session_frame_index()
+
+        if active_session_id in self.video_sessions:
+            self.active_video_session_id = active_session_id
+            self._restore_active_frame_sequence()
+        elif self.active_video_session_id not in self.video_sessions:
+            self.active_video_session_id = None
+            self.frame_sequence = None
+
+    def _cleanup_video_clip_caches(self):
+        allowed_root = self._video_clip_cache_root()
+        for session in self.video_sessions.values():
+            cache_dir = session.get("cache_dir")
+            if not cache_dir:
+                continue
+            if cleanup_managed_video_directory(cache_dir, allowed_root):
+                session.pop("cache_dir", None)
 
     def _sam3_frame_name_conflicts(self, frame_sequence):
         conflicts = []
+        project_names = {
+            _canonical_image_name(name): name for name in self.image_paths
+        }
+        seen_frame_keys = set()
         for frame in frame_sequence.frames:
-            existing_path = self.image_paths.get(frame.name)
+            frame_key = _canonical_image_name(frame.name)
+            if frame_key in seen_frame_keys:
+                conflicts.append(frame.name)
+                continue
+            seen_frame_keys.add(frame_key)
+            if frame_key in getattr(self, "_video_session_by_frame", {}):
+                conflicts.append(frame.name)
+                continue
+            existing_name = project_names.get(frame_key)
+            if existing_name is not None and existing_name != frame.name:
+                conflicts.append(frame.name)
+                continue
+            existing_path = self.image_paths.get(existing_name)
             if not existing_path:
                 continue
             existing_path = Path(existing_path)
@@ -6077,11 +6684,17 @@ class ImageAnnotator(QMainWindow):
                 ]
 
     def open_frame_folder(self):
-        if self._sam3_inference_in_flight:
-            self.show_warning("SAM 3 Tracker", "Wait for SAM 3 tracking to finish.")
+        if self._reject_while_sam3_busy():
+            return
+        if not self.image_label.check_unsaved_changes():
             return
         folder = QFileDialog.getExistingDirectory(self, "Select Video Frame Folder")
         if folder:
+            session_id = None
+            added_names = []
+            rollback_paths = []
+            previous_active_session_id = None
+            previous_image_name = None
             try:
                 frame_sequence = FrameSequence.from_folder(folder)
                 conflicts = self._sam3_frame_name_conflicts(frame_sequence)
@@ -6091,12 +6704,317 @@ class ImageAnnotator(QMainWindow):
                         "Frame names collide with images already loaded from "
                         f"another folder: {preview}"
                     )
+                if not self.save_project(show_message=False):
+                    detail = getattr(self, "_last_project_save_error", None)
+                    QMessageBox.critical(
+                        self,
+                        "Project Save Required",
+                        "The project must be saved before importing frames"
+                        f"{f': {detail}' if detail else '.'}",
+                    )
+                    return
+
+                previous_active_session_id = self.active_video_session_id
+                previous_image_name = self.image_file_name
+                project_images_dir = Path(self.current_project_dir) / "images"
+                rollback_paths = [
+                    project_images_dir / frame.name
+                    for frame in frame_sequence.frames
+                    if not (project_images_dir / frame.name).exists()
+                ]
                 self._reset_sam3_video_state()
+                session_id = uuid.uuid4().hex[:12]
+                while session_id in self.video_sessions:
+                    session_id = uuid.uuid4().hex[:12]
                 self.frame_sequence = frame_sequence
+                self.active_video_session_id = session_id
+                self.video_sessions[session_id] = {
+                    "source_type": "frame_folder",
+                    "source_path": str(frame_sequence.folder.resolve()),
+                    "frames": [
+                        {
+                            "name": frame.name,
+                            "source_index": frame.source_index,
+                        }
+                        for frame in frame_sequence.frames
+                    ],
+                }
+                self._rebuild_video_session_frame_index()
                 image_paths = [str(f.path) for f in frame_sequence.frames]
-                self.add_images_to_list(image_paths)
+                added_names = self.add_images_to_list(
+                    image_paths,
+                    auto_save=False,
+                )
+                project_names = {
+                    _canonical_image_name(name): name for name in self.image_paths
+                }
+                accepted_names = [
+                    project_names.get(_canonical_image_name(frame.name))
+                    for frame in frame_sequence.frames
+                ]
+                if any(name is None for name in accepted_names):
+                    raise RuntimeError(
+                        "Not all folder frames were registered with the project."
+                    )
+                if not self.save_project(show_message=False):
+                    detail = getattr(self, "_last_project_save_error", None)
+                    message = "The frame folder could not be saved to the project."
+                    raise RuntimeError(f"{message} {detail}" if detail else message)
             except Exception as e:
+                if session_id and session_id in self.video_sessions:
+                    self._rollback_video_session_import(
+                        session_id,
+                        added_names,
+                        rollback_paths,
+                        previous_active_session_id,
+                        previous_image_name,
+                    )
                 QMessageBox.critical(self, "Error", f"Failed to load frame folder: {str(e)}")
+
+    def open_video_clip(self):
+        if self._reject_while_sam3_busy():
+            return
+        if not self.image_label.check_unsaved_changes():
+            return
+
+        video_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video",
+            "",
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.m4v *.wmv);;All Files (*)",
+        )
+        if not video_path:
+            return
+
+        try:
+            metadata = probe_video(video_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Video Error", str(exc))
+            return
+
+        dialog = VideoClipDialog(metadata, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selection = dialog.selection()
+
+        try:
+            validate_video_source(metadata)
+        except Exception as exc:
+            QMessageBox.critical(self, "Video Error", str(exc))
+            return
+
+        # Establish the project before doing expensive work. Imported frames
+        # are copied into its images directory by the worker thread.
+        if not self.save_project(show_message=False):
+            detail = getattr(self, "_last_project_save_error", None)
+            QMessageBox.critical(
+                self,
+                "Project Save Required",
+                "The project must be saved before importing a video"
+                f"{f': {detail}' if detail else '.'}",
+            )
+            return
+
+        try:
+            video_cache_root = self._video_clip_cache_root()
+            output_dir = video_clip_cache_directory(
+                metadata.path,
+                selection,
+                video_cache_root,
+            )
+            session_id = uuid.uuid4().hex[:12]
+            output_dir = output_dir.with_name(f"{output_dir.name}_{session_id}")
+            project_images_dir = Path(self.current_project_dir) / "images"
+
+            total = selection.output_frame_count(metadata.frame_count)
+            progress = QProgressDialog(
+                "Importing selected video frames...",
+                "Cancel",
+                0,
+                total * 2,
+                self,
+            )
+            progress.setWindowTitle("Open Video Clip")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+
+            worker = VideoExtractionThread(
+                metadata,
+                selection,
+                output_dir,
+                project_images_dir=project_images_dir,
+                cache_root=video_cache_root,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Video Error", str(exc))
+            return
+
+        def update_extraction_progress(completed, frame_total):
+            progress.setMaximum(frame_total)
+            progress.setValue(completed)
+
+        cancel_requested = {"value": False}
+
+        def request_extraction_cancel():
+            cancel_requested["value"] = True
+            worker.requestInterruption()
+
+        worker.progress_changed.connect(update_extraction_progress)
+        progress.canceled.connect(request_extraction_cancel)
+        worker.finished.connect(progress.accept)
+        worker.start()
+        progress.exec()
+        if cancel_requested["value"]:
+            worker.requestInterruption()
+        worker.wait()
+
+        if cancel_requested["value"] or worker.cancelled:
+            if worker.result is not None:
+                for frame in worker.result.frames:
+                    try:
+                        frame.path.unlink()
+                    except OSError as cleanup_error:
+                        print(
+                            f"Could not remove cancelled frame {frame.path}: "
+                            f"{cleanup_error}"
+                        )
+            return
+        if worker.error:
+            QMessageBox.critical(
+                self,
+                "Video Error",
+                f"Failed to extract the selected frames:\n{worker.error}",
+            )
+            return
+
+        clip = worker.result
+        if clip is None:
+            return
+
+        frame_sequence = FrameSequence.from_paths(
+            clip.output_dir,
+            [frame.path for frame in clip.frames],
+            [frame.source_index for frame in clip.frames],
+        )
+        conflicts = self._sam3_frame_name_conflicts(frame_sequence)
+        if conflicts:
+            preview = ", ".join(conflicts[:5])
+            for frame in clip.frames:
+                try:
+                    frame.path.unlink()
+                except OSError as cleanup_error:
+                    print(
+                        f"Could not remove conflicting frame {frame.path}: "
+                        f"{cleanup_error}"
+                    )
+            QMessageBox.critical(
+                self,
+                "Video Error",
+                "Extracted frame names collide with different images already "
+                f"in this project: {preview}",
+            )
+            return
+
+        previous_active_session_id = self.active_video_session_id
+        previous_image_name = self.image_file_name
+        self._reset_sam3_video_state()
+        self.frame_sequence = frame_sequence
+        self.active_video_session_id = session_id
+        self.video_sessions[session_id] = {
+            "source_type": "video",
+            "source_path": str(metadata.path),
+            "frame_count": metadata.frame_count,
+            "fps": metadata.fps,
+            "width": metadata.width,
+            "height": metadata.height,
+            "start_frame": selection.start_frame,
+            "end_frame": selection.end_frame,
+            "stride": selection.stride,
+            "frames": [
+                {
+                    "name": frame.name,
+                    "source_index": frame.source_index,
+                }
+                for frame in frame_sequence.frames
+            ],
+        }
+        self._rebuild_video_session_frame_index()
+        added_names = []
+        try:
+            added_names = self.add_images_to_list(
+                [str(frame.path) for frame in frame_sequence.frames],
+                known_size=(metadata.width, metadata.height),
+                auto_save=False,
+            )
+            if len(added_names) != len(frame_sequence.frames):
+                raise RuntimeError("Not all extracted frames were added to the project.")
+            if not self.save_project(show_message=False):
+                detail = getattr(self, "_last_project_save_error", None)
+                message = "The imported clip could not be saved to the project."
+                raise RuntimeError(f"{message} {detail}" if detail else message)
+        except Exception as exc:
+            self._rollback_video_session_import(
+                session_id,
+                added_names,
+                [frame.path for frame in frame_sequence.frames],
+                previous_active_session_id,
+                previous_image_name,
+            )
+            QMessageBox.critical(
+                self,
+                "Video Error",
+                f"The video import was rolled back:\n{exc}",
+            )
+            return
+
+        self.show_info(
+            "Video Clip Loaded",
+            f"Loaded {len(frame_sequence.frames):,} frames from "
+            f"{metadata.path.name}. Use A and D to move frame by frame.",
+        )
+
+    def _rollback_video_session_import(
+        self,
+        session_id,
+        added_names,
+        frame_paths,
+        previous_active_session_id,
+        previous_image_name=None,
+    ):
+        if self.active_video_session_id == session_id:
+            self._reset_sam3_video_state()
+        self.video_sessions.pop(session_id, None)
+        self._rebuild_video_session_frame_index()
+
+        for name in added_names:
+            items = self.image_list.findItems(name, Qt.MatchFlag.MatchExactly)
+            if items:
+                self._remove_image_item(items[0], select_next=False)
+        for frame_path in frame_paths:
+            try:
+                Path(frame_path).unlink()
+            except OSError as cleanup_error:
+                print(
+                    f"Could not remove rolled-back frame {frame_path}: "
+                    f"{cleanup_error}"
+                )
+
+        if previous_active_session_id in self.video_sessions:
+            self.active_video_session_id = previous_active_session_id
+            self._restore_active_frame_sequence()
+        if self.image_list.count() > 0:
+            previous_items = (
+                self.image_list.findItems(
+                    previous_image_name,
+                    Qt.MatchFlag.MatchExactly,
+                )
+                if previous_image_name
+                else []
+            )
+            next_item = previous_items[0] if previous_items else self.image_list.item(0)
+            self.image_list.setCurrentItem(next_item)
+            self.switch_image(next_item)
 
     def go_to_next_frame(self):
         if self._sam3_inference_in_flight:
@@ -6164,7 +7082,9 @@ class ImageAnnotator(QMainWindow):
 
     def init_sam3_tracker(self):
         if not self.frame_sequence:
-            self.show_warning("SAM 3 Tracker", "Please open a Frame Folder first.")
+            self.show_warning(
+                "SAM 3 Tracker", "Please open an active video sequence first."
+            )
             return
         if self._sam3_inference_in_flight:
             self.show_warning("SAM 3 Tracker", "SAM 3 is already busy.")
@@ -6187,18 +7107,36 @@ class ImageAnnotator(QMainWindow):
                     if not selected_path:
                         return
                     ckpt_path = Path(selected_path)
-                self.sam3_tracker = _run_sync(SAM3Tracker, str(ckpt_path))
+                self.sam3_tracker = self._run_sam3_ui_locked(
+                    SAM3Tracker, str(ckpt_path)
+                )
 
-            folder_path = str(self.frame_sequence.folder)
-            _run_sync(self.sam3_tracker.init_state, folder_path)
+            self._prepare_sam3_frame_workspace()
+            self._run_sam3_ui_locked(
+                self.sam3_tracker.init_state,
+                str(self._sam3_frame_workspace),
+            )
             self.show_info("SAM 3 Tracker", "Successfully loaded frames into SAM 3 Tracker.")
         except InferenceBusyError:
             self.show_warning("SAM 3 Tracker", "Another AI inference is still running.")
         except Exception as e:
+            self._clear_sam3_frame_workspace()
             QMessageBox.critical(self, "SAM 3 Error", f"Failed to initialize tracker:\n{str(e)}")
         finally:
             self._sam3_inference_in_flight = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _prepare_sam3_frame_workspace(self):
+        if not self.frame_sequence:
+            raise ValueError("A frame sequence is required before tracking.")
+        self._clear_sam3_frame_workspace()
+        tracker_cache_root = self._sam3_tracker_cache_root()
+        self._sam3_frame_workspace = create_tracker_frame_workspace(
+            [frame.path for frame in self.frame_sequence.frames],
+            tracker_cache_root,
+        )
+        self._sam3_frame_workspace_root = tracker_cache_root
+        return self._sam3_frame_workspace
 
     def sam3_track_forward(self, all_objects=False):
         if self.sam3_tracker is None or not self.sam3_tracker.is_initialized:
@@ -6211,7 +7149,10 @@ class ImageAnnotator(QMainWindow):
         current_image_name = self.image_file_name
         current_idx = self.frame_sequence.index_for_name(current_image_name)
         if current_idx is None:
-            self.show_warning("Tracking", "The current image is not part of the open frame folder.")
+            self.show_warning(
+                "Tracking",
+                "The current image is not part of the active video sequence.",
+            )
             return
 
         self.save_current_annotations()
@@ -6276,7 +7217,7 @@ class ImageAnnotator(QMainWindow):
             self.setCursor(Qt.CursorShape.WaitCursor)
             tracked_annotation_count = 0
             frame_size = (self.current_image.width(), self.current_image.height())
-            results = _run_sync(
+            results = self._run_sam3_ui_locked(
                 self.sam3_tracker.track_polygons,
                 current_idx,
                 object_polygons,
@@ -6319,10 +7260,18 @@ class ImageAnnotator(QMainWindow):
                         )
                         tracked_annotation_count += 1
 
-            self.auto_save()
+            saved = self.auto_save()
             self.update_annotation_list()
             self.image_label.update()
             if tracked_annotation_count:
+                if not saved:
+                    self.show_warning(
+                        "SAM 3 Tracking",
+                        "Tracking annotations were generated but could not be "
+                        "saved to the project. They remain in memory; save the "
+                        "project before navigating away.",
+                    )
+                    return
                 next_name = self.frame_sequence.name_for_index(current_idx + 1)
                 if any(
                     class_name == "droplet"
@@ -6338,7 +7287,7 @@ class ImageAnnotator(QMainWindow):
             else:
                 self.show_warning(
                     "SAM 3 Tracking",
-                    "SAM 3 could not reproduce the selected large droplet on "
+                    "SAM 3 could not reproduce the selected object on "
                     "the source frame. No tracking annotations were saved.",
                 )
         except InferenceBusyError:
