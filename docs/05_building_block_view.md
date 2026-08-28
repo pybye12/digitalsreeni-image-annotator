@@ -165,7 +165,7 @@ export time — see [Cross-cutting Concepts](08_crosscutting_concepts.md)).
 ### Export Formats (export_formats.py)
 
 **Functions**:
-- `export_coco_json()`: COCO format with images directory
+- `export_coco_json()`: COCO format with images directory, including unlabeled negative examples and RLE masks for annotations with erased holes
 - `export_yolo_v5plus()`: YOLOv11-compatible structure
 - `export_yolo_v4()`: Legacy YOLO format
 - `export_labeled_images()`: Colored overlay visualizations
@@ -263,6 +263,9 @@ existing `_run_sync` worker-thread pattern.
 ```python
 {
     "segmentation": [x1, y1, x2, y2, x3, y3, ...],  # Flattened coordinates
+    "holes": [
+        [x1, y1, x2, y2, x3, y3, ...]
+    ],  # Optional erased interior regions
     "category": "class_name"
 }
 ```

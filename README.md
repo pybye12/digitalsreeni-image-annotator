@@ -52,8 +52,8 @@ masks for later frames, which must still be reviewed and corrected.
 Open **Git Bash**, then run:
 
 ```bash
-git clone --branch abdul/welding-video-extension --single-branch https://github.com/pybye12/digitalsreeni-image-annotator.git
-cd digitalsreeni-image-annotator
+git clone https://github.com/pybye12/welding-video-annotator.git
+cd welding-video-annotator
 py -3.11 -m venv .venv
 source .venv/Scripts/activate
 python -m pip install --upgrade pip
@@ -75,7 +75,7 @@ sreeni
 To open it again later:
 
 ```bash
-cd digitalsreeni-image-annotator
+cd welding-video-annotator
 source .venv/Scripts/activate
 sreeni
 ```
@@ -89,10 +89,13 @@ sreeni
 4. Select a class and draw labels with **Polygon**, **Paint Brush**, or another
    annotation tool. Press **Enter** to finish a polygon.
 5. Use the brightness and contrast controls when a boundary is faint. These
-   controls affect only the screen preview.
+   controls affect only the screen preview; brush strokes no longer change the
+   apparent brightness of untouched pixels.
 6. Review every frame and correct inaccurate boundaries.
-7. Save the project regularly.
-8. Select an export format and click **Export Annotations**. Use a new empty
+7. Select a class before using **Eraser**. It corrects only that class, so a
+   nearby class is not accidentally removed.
+8. Save the project regularly.
+9. Select an export format and click **Export Annotations**. Use a new empty
    folder when exporting RGB semantic masks.
 
 ### ER70S-6 presets
