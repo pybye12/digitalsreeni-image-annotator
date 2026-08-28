@@ -1,5 +1,6 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QColor
+from PyQt6.QtWidgets import QLabel
 
 from digitalsreeni_image_annotator.annotator_window import ImageAnnotator
 
@@ -68,3 +69,14 @@ def test_sidebar_exposes_common_loading_and_welding_actions(qtbot):
     assert window.add_class_button.text() == "Add Custom Class"
     assert window.class_list.maximumHeight() == 120
     assert window.annotation_list.maximumHeight() == 150
+    assert "on-screen preview" in window.brightness_slider.toolTip()
+    assert "exported mask" in window.brightness_slider.toolTip()
+    assert "press Enter" in window.polygon_button.toolTip()
+    assert "selected class" in window.eraser_button.toolTip()
+    assert window.export_button.property("buttonRole") == "primary"
+    assert "reviewed labels" in window.export_button.toolTip()
+
+    ai_hint = window.findChild(QLabel, "aiWorkflowHint")
+    sam3_scope = window.findChild(QLabel, "sam3ScopeLabel")
+    assert ai_hint is not None and "Track and review" in ai_hint.text()
+    assert sam3_scope is not None and "loaded in the Images list" in sam3_scope.text()

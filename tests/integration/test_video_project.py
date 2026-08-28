@@ -459,7 +459,7 @@ def test_sam3_tracking_preserves_a_non_droplet_class(qtbot, tmp_path):
     project_images = tmp_path / "images"
     project_images.mkdir()
     frame_paths = []
-    for index in range(2):
+    for index in range(4):
         frame_path = project_images / f"frame_{index}.jpg"
         image = QImage(32, 24, QImage.Format.Format_RGB888)
         image.fill(index * 50)
@@ -482,6 +482,8 @@ def test_sam3_tracking_preserves_a_non_droplet_class(qtbot, tmp_path):
             return [
                 (frame_index, {}),
                 (1, {1: [[4, 4, 12, 4, 12, 12, 4, 12]]}),
+                (2, {1: [[5, 4, 13, 4, 13, 12, 5, 12]]}),
+                (3, {1: [[6, 4, 14, 4, 14, 12, 6, 12]]}),
             ]
 
         def close_session(self):
@@ -502,7 +504,7 @@ def test_sam3_tracking_preserves_a_non_droplet_class(qtbot, tmp_path):
     window.frame_sequence = FrameSequence.from_paths(
         project_images,
         frame_paths,
-        [100, 101],
+        [100, 101, 102, 103],
     )
     window.active_video_session_id = "clip-a"
     window.video_sessions = {
@@ -510,7 +512,7 @@ def test_sam3_tracking_preserves_a_non_droplet_class(qtbot, tmp_path):
             "source_type": "video",
             "frames": [
                 {"name": path.name, "source_index": source_index}
-                for path, source_index in zip(frame_paths, (100, 101))
+                for path, source_index in zip(frame_paths, (100, 101, 102, 103))
             ],
         }
     }
@@ -526,6 +528,15 @@ def test_sam3_tracking_preserves_a_non_droplet_class(qtbot, tmp_path):
         "molten_consumable": [source_annotation]
     }
     window.all_annotations[frame_paths[0].name] = window.image_label.annotations
+    existing_manual = {
+        "segmentation": [18, 4, 24, 4, 24, 10, 18, 10],
+        "category_name": "molten_consumable",
+        "category_id": window.class_mapping["molten_consumable"],
+        "source": "manual",
+    }
+    window.all_annotations[frame_paths[2].name] = {
+        "molten_consumable": [existing_manual]
+    }
     tracker = FakeTracker()
     tracker.window = window
     window.sam3_tracker = tracker
@@ -540,6 +551,20 @@ def test_sam3_tracking_preserves_a_non_droplet_class(qtbot, tmp_path):
     tracked = window.all_annotations[frame_paths[1].name]["molten_consumable"]
     assert tracked[0]["category_name"] == "molten_consumable"
     assert "droplet_event_id" not in tracked[0]
+    source_id = tracked[0]["sam3_source_id"]
+    for frame_path in frame_paths[1:]:
+        generated = [
+            annotation
+            for annotation in window.all_annotations[frame_path.name][
+                "molten_consumable"
+            ]
+            if annotation.get("source") == "sam3_track"
+        ]
+        assert len(generated) == 1
+        assert generated[0]["sam3_source_id"] == source_id
+    assert existing_manual in window.all_annotations[frame_paths[2].name][
+        "molten_consumable"
+    ]
 
     window.image_list.setCurrentItem(first_item)
     window.switch_image(first_item)

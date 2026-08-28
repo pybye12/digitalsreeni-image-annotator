@@ -3130,6 +3130,12 @@ class ImageAnnotator(QMainWindow):
             label.setWordWrap(True)
             return label
 
+        def describe(widget, text):
+            """Expose plain-language help to mouse and keyboard users."""
+            widget.setToolTip(text)
+            widget.setStatusTip(text)
+            widget.setAccessibleDescription(text)
+
         def group(title):
             box = QGroupBox(title)
             box_layout = QVBoxLayout(box)
@@ -3249,6 +3255,11 @@ class ImageAnnotator(QMainWindow):
         self.brightness_slider.setRange(-100, 100)
         self.brightness_slider.setValue(0)
         self.brightness_slider.valueChanged.connect(self.update_display_adjustments)
+        describe(
+            self.brightness_slider,
+            "Lighten or darken only the on-screen preview. The source image "
+            "and exported mask are not changed.",
+        )
         display_layout.addWidget(QLabel("Brightness"), 0, 0)
         display_layout.addWidget(self.brightness_slider, 0, 1)
         display_layout.addWidget(self.brightness_value_label, 0, 2)
@@ -3258,6 +3269,11 @@ class ImageAnnotator(QMainWindow):
         self.contrast_slider.setRange(-100, 100)
         self.contrast_slider.setValue(0)
         self.contrast_slider.valueChanged.connect(self.update_display_adjustments)
+        describe(
+            self.contrast_slider,
+            "Change preview contrast to make faint boundaries easier to see. "
+            "The source image and exports are not changed.",
+        )
         display_layout.addWidget(QLabel("Contrast"), 1, 0)
         display_layout.addWidget(self.contrast_slider, 1, 1)
         display_layout.addWidget(self.contrast_value_label, 1, 2)
@@ -3276,16 +3292,33 @@ class ImageAnnotator(QMainWindow):
         button_layout_top = QHBoxLayout()
         self.polygon_button = QPushButton("Polygon")
         self.polygon_button.setCheckable(True)
+        describe(
+            self.polygon_button,
+            "Click around one object boundary, then press Enter to finish the mask.",
+        )
         self.rectangle_button = QPushButton("Rectangle")
         self.rectangle_button.setCheckable(True)
+        describe(
+            self.rectangle_button,
+            "Drag a rectangle around an object to create a box annotation.",
+        )
         button_layout_top.addWidget(self.polygon_button)
         button_layout_top.addWidget(self.rectangle_button)
 
         button_layout_bottom = QHBoxLayout()
         self.paint_brush_button = QPushButton("Paint Brush")
         self.paint_brush_button.setCheckable(True)
+        describe(
+            self.paint_brush_button,
+            "Paint pixels into the selected class. Display adjustments remain "
+            "preview-only while painting.",
+        )
         self.eraser_button = QPushButton("Eraser")
         self.eraser_button.setCheckable(True)
+        describe(
+            self.eraser_button,
+            "Remove pixels only from the selected class without changing other classes.",
+        )
         button_layout_bottom.addWidget(self.paint_brush_button)
         button_layout_bottom.addWidget(self.eraser_button)
 
@@ -3350,6 +3383,11 @@ class ImageAnnotator(QMainWindow):
 
         self.export_button = QPushButton("Export Annotations")
         self.export_button.clicked.connect(self.export_annotations)
+        self.export_button.setProperty("buttonRole", "primary")
+        describe(
+            self.export_button,
+            "Write the reviewed labels to a folder without modifying source images.",
+        )
         export_layout.addWidget(self.export_button)
         export_layout.addWidget(
             help_text(
@@ -3362,11 +3400,16 @@ class ImageAnnotator(QMainWindow):
 
         self.ai_scroll, self.ai_page, ai_layout = scroll_page()
         self.sidebar_tabs.addTab(self.ai_scroll, "AI Assist")
+        ai_workflow_hint = QLabel(
+            "AI ASSIST\n"
+            "1. Draw a clean mask  >  2. Prepare frames  >  3. Track and review"
+        )
+        ai_workflow_hint.setObjectName("aiWorkflowHint")
+        ai_workflow_hint.setProperty("cardRole", "notice")
+        ai_workflow_hint.setWordWrap(True)
+        ai_layout.addWidget(ai_workflow_hint)
         ai_layout.addWidget(
-            help_text(
-                "AI results are proposals. Review and correct every generated mask "
-                "before exporting ground-truth labels."
-            )
+            help_text("AI masks are suggestions, not final labels. Check every frame.")
         )
 
         sam2_group, sam2_layout = group("SAM 2 - current image")
@@ -3392,24 +3435,50 @@ class ImageAnnotator(QMainWindow):
         ai_layout.addWidget(sam2_group)
 
         sam3_group, sam3_layout = group("SAM 3 - video propagation")
-        self.sam3_init_btn = QPushButton("Load Video Frames to SAM 3")
+        sam3_scope = QLabel(
+            "Tracks from the current frame to the end of the frames currently "
+            "loaded in the Images list."
+        )
+        sam3_scope.setObjectName("sam3ScopeLabel")
+        sam3_scope.setProperty("cardRole", "info")
+        sam3_scope.setWordWrap(True)
+        sam3_layout.addWidget(sam3_scope)
+
+        self.sam3_init_btn = QPushButton("1. Prepare Loaded Frames")
         self.sam3_init_btn.clicked.connect(self.init_sam3_tracker)
+        self.sam3_init_btn.setProperty("buttonRole", "primary")
+        describe(
+            self.sam3_init_btn,
+            "Load the current image sequence into SAM 3. Only frames shown in "
+            "the Images list are prepared.",
+        )
         sam3_layout.addWidget(self.sam3_init_btn)
 
         sam3_buttons_layout = QHBoxLayout()
-        self.sam3_track_forward_btn = QPushButton("Track Selected Forward")
+        self.sam3_track_forward_btn = QPushButton("2. Track Selected to End")
         self.sam3_track_forward_btn.clicked.connect(self.sam3_track_forward)
-        self.sam3_track_all_btn = QPushButton("Track All Objects")
+        describe(
+            self.sam3_track_forward_btn,
+            "Select one polygon in the annotation list, then predict its mask on "
+            "later loaded frames. Tracking stops after two consecutive misses.",
+        )
+        self.sam3_track_all_btn = QPushButton("Track All to End")
         self.sam3_track_all_btn.clicked.connect(
             lambda: self.sam3_track_forward(all_objects=True)
+        )
+        describe(
+            self.sam3_track_all_btn,
+            "Predict every valid polygon on this frame across later loaded frames. "
+            "Existing manual annotations are preserved.",
         )
         sam3_buttons_layout.addWidget(self.sam3_track_forward_btn)
         sam3_buttons_layout.addWidget(self.sam3_track_all_btn)
         sam3_layout.addLayout(sam3_buttons_layout)
         sam3_layout.addWidget(
             help_text(
-                "Draw a polygon in Labeling, select it in the annotation list, "
-                "then load the frames and track forward."
+                "Start with a clean polygon on the current frame. SAM 3 follows it "
+                "forward until the sequence ends or the object is missed twice. "
+                "Correct mistakes in Labeling before export."
             )
         )
         ai_layout.addWidget(sam3_group)
@@ -7187,7 +7256,12 @@ class ImageAnnotator(QMainWindow):
                 self.sam3_tracker.init_state,
                 str(self._sam3_frame_workspace),
             )
-            self.show_info("SAM 3 Tracker", "Successfully loaded frames into SAM 3 Tracker.")
+            frame_count = len(self.frame_sequence.frames)
+            self.show_info(
+                "SAM 3 Tracker",
+                f"Prepared {frame_count} loaded frame(s). Draw or select a polygon "
+                "on the current frame, then track it to the end.",
+            )
         except InferenceBusyError:
             self.show_warning("SAM 3 Tracker", "Another AI inference is still running.")
         except Exception as e:

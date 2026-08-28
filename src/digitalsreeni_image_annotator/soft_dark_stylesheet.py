@@ -2,13 +2,13 @@
 
 soft_dark_stylesheet = """
 QWidget {
-    background-color: #2F2F2F;
-    color: #E0E0E0;
+    background-color: #1D232B;
+    color: #E7ECF2;
     font-family: Arial, sans-serif;
 }
 
 QMainWindow {
-    background-color: #2A2A2A;
+    background-color: #151A20;
 }
 
 QPushButton {
@@ -33,9 +33,43 @@ QPushButton:checked {
     color: #FFFFFF;
 }
 
+QPushButton[buttonRole="primary"] {
+    background-color: #2563EB;
+    border: 1px solid #3B82F6;
+    color: #FFFFFF;
+    font-weight: bold;
+    padding: 7px 10px;
+}
+
+QPushButton[buttonRole="primary"]:hover {
+    background-color: #3478F6;
+    border-color: #60A5FA;
+}
+
+QPushButton[buttonRole="primary"]:pressed {
+    background-color: #1D4ED8;
+}
+
+QLabel[cardRole="notice"] {
+    background-color: #172A46;
+    border: 1px solid #315F9A;
+    border-radius: 6px;
+    padding: 10px;
+    color: #EAF3FF;
+    font-weight: bold;
+}
+
+QLabel[cardRole="info"] {
+    background-color: #202C3A;
+    border-left: 3px solid #3B82F6;
+    border-radius: 4px;
+    padding: 8px;
+    color: #D8E8FF;
+}
+
 QListWidget, QTreeWidget {
-    background-color: #3A3A3A;
-    border: 1px solid #4A4A4A;
+    background-color: #242B34;
+    border: 1px solid #3B4654;
     border-radius: 3px;
     color: #E0E0E0;
 }
@@ -102,8 +136,9 @@ QTabBar::tab {
 }
 
 QTabBar::tab:selected {
-    background-color: #555555;
+    background-color: #263C5A;
     color: #FFFFFF;
+    border-bottom: 2px solid #3B82F6;
 }
 
 QLineEdit, QTextEdit, QPlainTextEdit {

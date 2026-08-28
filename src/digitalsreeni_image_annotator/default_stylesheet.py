@@ -31,6 +31,40 @@ QPushButton:checked {
     color: #FFFFFF;
 }
 
+QPushButton[buttonRole="primary"] {
+    background-color: #2563EB;
+    border: 1px solid #1D4ED8;
+    color: #FFFFFF;
+    font-weight: bold;
+    padding: 7px 10px;
+}
+
+QPushButton[buttonRole="primary"]:hover {
+    background-color: #3B82F6;
+    border-color: #2563EB;
+}
+
+QPushButton[buttonRole="primary"]:pressed {
+    background-color: #1D4ED8;
+}
+
+QLabel[cardRole="notice"] {
+    background-color: #EAF2FF;
+    border: 1px solid #9CC2F5;
+    border-radius: 6px;
+    padding: 10px;
+    color: #17365D;
+    font-weight: bold;
+}
+
+QLabel[cardRole="info"] {
+    background-color: #F1F6FD;
+    border-left: 3px solid #2563EB;
+    border-radius: 4px;
+    padding: 8px;
+    color: #263746;
+}
+
 
 QListWidget, QTreeWidget {
     background-color: #FFFFFF;
@@ -98,8 +132,9 @@ QTabBar::tab {
 }
 
 QTabBar::tab:selected {
-    background-color: #FFFFFF;
+    background-color: #EAF2FF;
     color: #222222;
+    border-bottom: 2px solid #2563EB;
 }
 
 
