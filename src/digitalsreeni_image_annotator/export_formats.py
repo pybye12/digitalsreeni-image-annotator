@@ -11,6 +11,7 @@ from datetime import datetime
 
 import numpy as np
 import skimage.draw
+import skimage.morphology
 from PIL import Image
 
 
@@ -41,12 +42,14 @@ def export_coco_json(all_annotations, class_mapping, image_paths, slices, image_
     image_id = 1
     # Create a mapping of slice names to their QImage objects
     slice_map = {slice_name: qimage for slice_name, qimage in slices}
+    for stack_slices in image_slices.values():
+        slice_map.update(stack_slices)
     
     # Handle all images and slices
-    for image_name, annotations in all_annotations.items():
-        # Skip if there are no annotations for this image/slice
-        if not annotations:
-            continue
+    for image_name in _rgb_export_inventory(
+        all_annotations, image_paths, slices, image_slices
+    ):
+        annotations = all_annotations.get(image_name, {})
 
         # Check if it's a slice (either in slice_map or has underscores and no file extension)
         is_slice = image_name in slice_map or ('_' in image_name and '.' not in image_name)
@@ -78,7 +81,7 @@ def export_coco_json(all_annotations, class_mapping, image_paths, slices, image_
                 print(f"Image {file_name_img} already exists in the target directory. Skipping save.")
         else:
             # Check if the image_name exists in image_paths
-            image_path = next((path for name, path in image_paths.items() if image_name in name), None)
+            image_path = _find_export_image_path(image_name, image_paths)
             if not image_path:
                 print(f"No image path found for {image_name}, skipping")
                 continue
@@ -103,7 +106,14 @@ def export_coco_json(all_annotations, class_mapping, image_paths, slices, image_
         
         for class_name, class_annotations in annotations.items():
             for ann in class_annotations:
-                coco_ann = create_coco_annotation(ann, image_id, annotation_id, class_name, class_mapping)
+                coco_ann = create_coco_annotation(
+                    ann,
+                    image_id,
+                    annotation_id,
+                    class_name,
+                    class_mapping,
+                    image_size=(image_info["height"], image_info["width"]),
+                )
                 coco_format["annotations"].append(coco_ann)
                 annotation_id += 1
         
@@ -124,7 +134,25 @@ def export_coco_json(all_annotations, class_mapping, image_paths, slices, image_
     return json_file_path, images_dir
 
 
-def create_coco_annotation(ann, image_id, annotation_id, class_name, class_mapping):
+def _mask_to_uncompressed_rle(mask):
+    pixels = mask.astype(np.uint8).flatten(order="F")
+    counts = []
+    previous = 0
+    run_length = 0
+    for pixel in pixels:
+        value = int(pixel)
+        if value != previous:
+            counts.append(run_length)
+            run_length = 0
+            previous = value
+        run_length += 1
+    counts.append(run_length)
+    return {"size": list(mask.shape), "counts": counts}
+
+
+def create_coco_annotation(
+    ann, image_id, annotation_id, class_name, class_mapping, image_size=None
+):
     coco_ann = {
         "id": annotation_id,
         "image_id": image_id,
@@ -133,9 +161,33 @@ def create_coco_annotation(ann, image_id, annotation_id, class_name, class_mappi
         "iscrowd": 0
     }
     
-    if "segmentation" in ann:
-        coco_ann["segmentation"] = [ann["segmentation"]]
-        coco_ann["bbox"] = calculate_bbox(ann["segmentation"])
+    if "segmentation" in ann and ann.get("holes"):
+        if image_size is None:
+            raise ValueError("image_size is required for annotations with erased holes")
+        height, width = image_size
+        coverage = _annotation_coverage(height, width, ann)
+        coco_ann["segmentation"] = _mask_to_uncompressed_rle(coverage)
+        coco_ann["area"] = int(coverage.sum())
+        rows, columns = np.nonzero(coverage)
+        if len(columns):
+            x_min, x_max = int(columns.min()), int(columns.max())
+            y_min, y_max = int(rows.min()), int(rows.max())
+            coco_ann["bbox"] = [
+                x_min,
+                y_min,
+                x_max - x_min + 1,
+                y_max - y_min + 1,
+            ]
+        else:
+            coco_ann["bbox"] = [0, 0, 0, 0]
+    elif "segmentation" in ann:
+        segmentation = ann["segmentation"]
+        coco_ann["segmentation"] = (
+            segmentation
+            if segmentation and isinstance(segmentation[0], list)
+            else [segmentation]
+        )
+        coco_ann["bbox"] = calculate_bbox(segmentation)
     elif "bbox" in ann:
         coco_ann["bbox"] = ann["bbox"]
     
@@ -431,7 +483,7 @@ def export_labeled_images(all_annotations, class_mapping, image_paths, slices, i
             img_width, img_height = qimage.width(), qimage.height()
         else:
             # Check if the image_name exists in image_paths
-            image_path = next((path for name, path in image_paths.items() if image_name in name), None)
+            image_path = _find_export_image_path(image_name, image_paths)
             if not image_path:
                 print(f"No image path found for {image_name}, skipping")
                 continue
@@ -459,9 +511,8 @@ def export_labeled_images(all_annotations, class_mapping, image_paths, slices, i
                 object_number = np.max(mask) + 1  # Increment object number for this class
                 
                 if 'segmentation' in ann:
-                    polygon = np.array(ann['segmentation']).reshape(-1, 2)
-                    rr, cc = skimage.draw.polygon(polygon[:, 1], polygon[:, 0], (img_height, img_width))
-                    mask[rr, cc] = object_number
+                    coverage = _annotation_coverage(img_height, img_width, ann)
+                    mask[coverage] = object_number
                 elif 'bbox' in ann:
                     x, y, w, h = map(int, ann['bbox'])
                     mask[y:y+h, x:x+w] = object_number
@@ -536,7 +587,7 @@ def export_semantic_labels(all_annotations, class_mapping, image_paths, slices, 
             img_width, img_height = qimage.width(), qimage.height()
         else:
             # Check if the image_name exists in image_paths
-            image_path = next((path for name, path in image_paths.items() if image_name in name), None)
+            image_path = _find_export_image_path(image_name, image_paths)
             if not image_path:
                 print(f"No image path found for {image_name}, skipping")
                 continue
@@ -561,9 +612,8 @@ def export_semantic_labels(all_annotations, class_mapping, image_paths, slices, 
             pixel_value = class_to_pixel[class_name]
             for ann in class_annotations:
                 if 'segmentation' in ann:
-                    polygon = np.array(ann['segmentation']).reshape(-1, 2)
-                    rr, cc = skimage.draw.polygon(polygon[:, 1], polygon[:, 0], (img_height, img_width))
-                    semantic_mask[rr, cc] = pixel_value
+                    coverage = _annotation_coverage(img_height, img_width, ann)
+                    semantic_mask[coverage] = pixel_value
                 elif 'bbox' in ann:
                     x, y, w, h = map(int, ann['bbox'])
                     semantic_mask[y:y+h, x:x+w] = pixel_value
@@ -622,6 +672,14 @@ def _annotation_coverage(height, width, annotation):
                 polygon[:, 1], polygon[:, 0], (height, width)
             )
             coverage[rows, columns] = True
+        for hole_values in annotation.get("holes", []):
+            hole = np.asarray(hole_values, dtype=np.float64).reshape(-1, 2)
+            if len(hole) < 3:
+                continue
+            rows, columns = skimage.draw.polygon(
+                hole[:, 1], hole[:, 0], (height, width)
+            )
+            coverage[rows, columns] = False
         return coverage
 
     bbox = annotation.get("bbox")
@@ -757,12 +815,22 @@ def export_rgb_semantic_masks(
                     coverage = _annotation_coverage(height, width, annotation)
                     conflicting = (owners >= 0) & (owners != class_index) & coverage
                     if conflicting.any():
-                        previous_index = int(owners[conflicting][0])
-                        raise ValueError(
-                            f"Overlapping class annotations in '{image_name}': "
-                            f"'{class_names[previous_index]}' and '{class_name}'. "
-                            "Correct the overlap before exporting."
-                        )
+                        current_interior = skimage.morphology.erosion(coverage)
+                        for previous_index in np.unique(owners[conflicting]):
+                            previous_coverage = owners == previous_index
+                            previous_interior = skimage.morphology.erosion(
+                                previous_coverage
+                            )
+                            if (
+                                current_interior
+                                & previous_interior
+                                & conflicting
+                            ).any():
+                                raise ValueError(
+                                    f"Overlapping class annotations in '{image_name}': "
+                                    f"'{class_names[int(previous_index)]}' and "
+                                    f"'{class_name}'. Correct the overlap before exporting."
+                                )
                     rgb_mask[coverage] = rgb_colors[class_name]
                     owners[coverage] = class_index
 
@@ -843,7 +911,7 @@ def export_pascal_voc_bbox(all_annotations, class_mapping, image_paths, slices, 
             img_width, img_height = qimage.width(), qimage.height()
         else:
             # Check if the image_name exists in image_paths
-            image_path = next((path for name, path in image_paths.items() if image_name in name), None)
+            image_path = _find_export_image_path(image_name, image_paths)
             if not image_path:
                 print(f"No image path found for {image_name}, skipping")
                 continue
@@ -946,7 +1014,7 @@ def export_pascal_voc_both(all_annotations, class_mapping, image_paths, slices, 
             img_width, img_height = qimage.width(), qimage.height()
         else:
             # Check if the image_name exists in image_paths
-            image_path = next((path for name, path in image_paths.items() if image_name in name), None)
+            image_path = _find_export_image_path(image_name, image_paths)
             if not image_path:
                 print(f"No image path found for {image_name}, skipping")
                 continue

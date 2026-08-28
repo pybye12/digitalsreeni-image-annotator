@@ -3293,8 +3293,9 @@ class ImageAnnotator(QMainWindow):
         manual_layout.addLayout(button_layout_bottom)
         manual_layout.addWidget(
             help_text(
-                "Polygon: click around a boundary and press Enter. Use - and = "
-                "to change brush or eraser size."
+                "Polygon: click around a boundary and press Enter. The eraser "
+                "changes only the selected class. Use - and = to change brush "
+                "or eraser size."
             )
         )
         labeling_layout.addWidget(manual_group)

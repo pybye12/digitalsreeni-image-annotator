@@ -23,6 +23,7 @@ from PyQt6.QtGui import (
     QKeyEvent,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QPolygon,
@@ -34,6 +35,69 @@ from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 from .display_adjustments import adjust_qimage
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def _segmentation_polygons(segmentation):
+    if not segmentation:
+        return []
+    if isinstance(segmentation[0], (list, tuple, np.ndarray)):
+        return segmentation
+    return [segmentation]
+
+
+def _annotation_mask(annotation, shape):
+    mask = np.zeros(shape, dtype=np.uint8)
+    for polygon in _segmentation_polygons(annotation.get("segmentation")):
+        points = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+        if len(points) >= 3:
+            cv2.fillPoly(mask, [np.rint(points).astype(np.int32)], 255)
+    for hole in annotation.get("holes", []):
+        points = np.asarray(hole, dtype=np.float64).reshape(-1, 2)
+        if len(points) >= 3:
+            cv2.fillPoly(mask, [np.rint(points).astype(np.int32)], 0)
+    return mask
+
+
+def _mask_components(mask, minimum_area=10):
+    contours, hierarchy = cv2.findContours(
+        mask.astype(np.uint8),
+        cv2.RETR_CCOMP,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if hierarchy is None:
+        return []
+
+    components = []
+    hierarchy = hierarchy[0]
+    for index, contour in enumerate(contours):
+        if hierarchy[index][3] != -1 or cv2.contourArea(contour) <= minimum_area:
+            continue
+        holes = []
+        child_index = hierarchy[index][2]
+        while child_index != -1:
+            child = contours[child_index]
+            if len(child) >= 3 and cv2.contourArea(child) > 1:
+                holes.append(child.flatten().tolist())
+            child_index = hierarchy[child_index][0]
+        components.append((contour.flatten().tolist(), holes))
+    return components
+
+
+def _mask_overlay_image(mask, color, alpha=128):
+    """Build a transparent overlay without dimming unpainted pixels."""
+    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    active = mask.astype(bool)
+    rgba[active, 0] = color.red()
+    rgba[active, 1] = color.green()
+    rgba[active, 2] = color.blue()
+    rgba[active, 3] = alpha
+    return QImage(
+        rgba.data,
+        mask.shape[1],
+        mask.shape[0],
+        rgba.strides[0],
+        QImage.Format.Format_RGBA8888,
+    ).copy()
 
 
 class ImageLabel(QLabel):
@@ -266,44 +330,35 @@ class ImageLabel(QLabel):
             current_name = (
                 self.main_window.current_slice or self.main_window.image_file_name
             )
-            annotations_changed = False
+            class_name = self.main_window.current_class
+            annotations = self.annotations.get(class_name, [])
+            updated_annotations = []
+            max_number = max([ann.get("number", 0) for ann in annotations] + [0])
+            for annotation in annotations:
+                if "segmentation" not in annotation:
+                    updated_annotations.append(annotation)
+                    continue
 
-            for class_name, annotations in self.annotations.items():
-                updated_annotations = []
-                max_number = max([ann.get("number", 0) for ann in annotations] + [0])
-                for annotation in annotations:
-                    if "segmentation" in annotation:
-                        points = (
-                            np.array(annotation["segmentation"])
-                            .reshape(-1, 2)
-                            .astype(int)
-                        )
-                        mask = np.zeros_like(self.temp_eraser_mask)
-                        cv2.fillPoly(mask, [points], 255)
-                        mask = mask.astype(bool)
-                        mask[eraser_mask] = False
-                        contours, _ = cv2.findContours(
-                            mask.astype(np.uint8),
-                            cv2.RETR_EXTERNAL,
-                            cv2.CHAIN_APPROX_SIMPLE,
-                        )
-                        for i, contour in enumerate(contours):
-                            if cv2.contourArea(contour) > 10:  # Minimum area threshold
-                                new_segmentation = contour.flatten().tolist()
-                                new_annotation = annotation.copy()
-                                new_annotation["segmentation"] = new_segmentation
-                                if i == 0:
-                                    new_annotation["number"] = annotation.get(
-                                        "number", max_number + 1
-                                    )
-                                else:
-                                    max_number += 1
-                                    new_annotation["number"] = max_number
-                                updated_annotations.append(new_annotation)
-                        if len(contours) > 1:
-                            annotations_changed = True
+                mask = _annotation_mask(annotation, self.temp_eraser_mask.shape)
+                mask[eraser_mask] = 0
+                for component_index, (segmentation, holes) in enumerate(
+                    _mask_components(mask)
+                ):
+                    new_annotation = annotation.copy()
+                    new_annotation["segmentation"] = segmentation
+                    if holes:
+                        new_annotation["holes"] = holes
                     else:
-                        updated_annotations.append(annotation)
+                        new_annotation.pop("holes", None)
+                    if component_index == 0:
+                        new_annotation["number"] = annotation.get(
+                            "number", max_number + 1
+                        )
+                    else:
+                        max_number += 1
+                        new_annotation["number"] = max_number
+                    updated_annotations.append(new_annotation)
+            if class_name in self.annotations:
                 self.annotations[class_name] = updated_annotations
 
             self.temp_eraser_mask = None
@@ -441,19 +496,11 @@ class ImageLabel(QLabel):
             painter.save()
             painter.translate(self.offset_x, self.offset_y)
             painter.scale(self.zoom_factor, self.zoom_factor)
-
-            mask_image = QImage(
-                self.temp_paint_mask.data,
-                self.temp_paint_mask.shape[1],
-                self.temp_paint_mask.shape[0],
-                self.temp_paint_mask.shape[1],
-                QImage.Format.Format_Grayscale8,
+            color = self.class_colors.get(
+                self.main_window.current_class,
+                QColor(0, 255, 0),
             )
-            mask_pixmap = QPixmap.fromImage(mask_image)
-            painter.setOpacity(0.5)
-            painter.drawPixmap(0, 0, mask_pixmap)
-            painter.setOpacity(1.0)
-
+            painter.drawImage(0, 0, _mask_overlay_image(self.temp_paint_mask, color))
             painter.restore()
 
     def draw_temp_eraser_mask(self, painter):
@@ -462,18 +509,14 @@ class ImageLabel(QLabel):
             painter.translate(self.offset_x, self.offset_y)
             painter.scale(self.zoom_factor, self.zoom_factor)
 
-            mask_image = QImage(
-                self.temp_eraser_mask.data,
-                self.temp_eraser_mask.shape[1],
-                self.temp_eraser_mask.shape[0],
-                self.temp_eraser_mask.shape[1],
-                QImage.Format.Format_Grayscale8,
+            painter.drawImage(
+                0,
+                0,
+                _mask_overlay_image(
+                    self.temp_eraser_mask,
+                    QColor(255, 64, 64),
+                ),
             )
-            mask_pixmap = QPixmap.fromImage(mask_image)
-            painter.setOpacity(0.5)
-            painter.drawPixmap(0, 0, mask_pixmap)
-            painter.setOpacity(1.0)
-
             painter.restore()
 
     def draw_tool_size_indicator(self, painter):
@@ -657,21 +700,26 @@ class ImageLabel(QLabel):
                 if "segmentation" in annotation:
                     segmentation = annotation["segmentation"]
                     if isinstance(segmentation, list) and len(segmentation) > 0:
-                        if isinstance(segmentation[0], list):  # Multiple polygons
-                            for polygon in segmentation:
-                                points = [
-                                    QPointF(float(x), float(y))
-                                    for x, y in zip(polygon[0::2], polygon[1::2])
-                                ]
-                                if points:
-                                    painter.drawPolygon(QPolygonF(points))
-                        else:  # Single polygon
+                        path = QPainterPath()
+                        path.setFillRule(Qt.FillRule.OddEvenFill)
+                        points = []
+                        for polygon in _segmentation_polygons(segmentation):
                             points = [
                                 QPointF(float(x), float(y))
-                                for x, y in zip(segmentation[0::2], segmentation[1::2])
+                                for x, y in zip(polygon[0::2], polygon[1::2])
                             ]
                             if points:
-                                painter.drawPolygon(QPolygonF(points))
+                                path.addPolygon(QPolygonF(points))
+                                path.closeSubpath()
+                        for hole in annotation.get("holes", []):
+                            hole_points = [
+                                QPointF(float(x), float(y))
+                                for x, y in zip(hole[0::2], hole[1::2])
+                            ]
+                            if hole_points:
+                                path.addPolygon(QPolygonF(hole_points))
+                                path.closeSubpath()
+                        painter.drawPath(path)
 
                         # Draw centroid and label
                         if points:

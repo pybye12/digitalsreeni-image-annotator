@@ -33,19 +33,55 @@ def models_base_dir() -> str:
     return os.path.join(os.getcwd(), "models")
 
 
+def _segmentation_polygons(segmentation):
+    if not segmentation:
+        return []
+    if isinstance(segmentation[0], (list, tuple, np.ndarray)):
+        return segmentation
+    return [segmentation]
+
+
+def _polygon_area(polygon):
+    x_coordinates = polygon[0::2]
+    y_coordinates = polygon[1::2]
+    if len(x_coordinates) < 3:
+        return 0
+    return 0.5 * abs(
+        sum(
+            x_coordinates[index] * y_coordinates[index + 1]
+            - x_coordinates[index + 1] * y_coordinates[index]
+            for index in range(-1, len(x_coordinates) - 1)
+        )
+    )
+
+
 def calculate_area(annotation):
     if "segmentation" in annotation and annotation["segmentation"] is not None:
-        # Polygon area
-        x, y = annotation["segmentation"][0::2], annotation["segmentation"][1::2]
-        return 0.5 * abs(sum(x[i] * y[i+1] - x[i+1] * y[i] for i in range(-1, len(x)-1)))
+        area = sum(
+            _polygon_area(polygon)
+            for polygon in _segmentation_polygons(annotation["segmentation"])
+        )
+        hole_area = sum(
+            _polygon_area(polygon) for polygon in annotation.get("holes", [])
+        )
+        return max(0, area - hole_area)
     elif "bbox" in annotation:
         # Rectangle area
         x, y, w, h = annotation["bbox"]
         return w * h
     return 0
 
+
 def calculate_bbox(segmentation):
-    x_coordinates, y_coordinates = segmentation[0::2], segmentation[1::2]
+    polygons = _segmentation_polygons(segmentation)
+    x_coordinates = [
+        coordinate for polygon in polygons for coordinate in polygon[0::2]
+    ]
+    y_coordinates = [
+        coordinate for polygon in polygons for coordinate in polygon[1::2]
+    ]
+    if not x_coordinates or not y_coordinates:
+        return [0, 0, 0, 0]
     x_min, y_min = min(x_coordinates), min(y_coordinates)
     x_max, y_max = max(x_coordinates), max(y_coordinates)
     width, height = x_max - x_min, y_max - y_min

@@ -252,7 +252,7 @@ class TestCOCOExport:
     def test_export_coco_empty_annotations(
         self, temp_output_dir, sample_class_mapping, sample_image_paths
     ):
-        """Test COCO export with no annotations."""
+        """COCO keeps loaded images as negative examples without annotations."""
         empty_annotations = {}
         json_file_path, images_dir = export_coco_json(
             empty_annotations,
@@ -266,7 +266,8 @@ class TestCOCOExport:
         with open(json_file_path, 'r') as f:
             coco_data = json.load(f)
 
-        assert len(coco_data["images"]) == 0
+        assert len(coco_data["images"]) == 1
+        assert coco_data["images"][0]["file_name"] == "test_image.png"
         assert len(coco_data["annotations"]) == 0
         assert len(coco_data["categories"]) == 2  # Categories still present
 
@@ -488,10 +489,10 @@ class TestExportEdgeCases:
 
         assert len(coco_data["categories"]) == 0
 
-    def test_export_coco_skips_images_without_annotations(
+    def test_export_coco_keeps_images_without_annotations(
         self, temp_output_dir, sample_class_mapping, sample_image_paths
     ):
-        """Test that images without annotations are skipped."""
+        """Test that unlabeled images remain available as negative examples."""
         annotations = {
             "test_image.png": {}  # Empty annotations dict
         }
@@ -508,8 +509,8 @@ class TestExportEdgeCases:
         with open(json_file_path, 'r') as f:
             coco_data = json.load(f)
 
-        # Should skip the image since it has no annotations
-        assert len(coco_data["images"]) == 0
+        assert len(coco_data["images"]) == 1
+        assert len(coco_data["annotations"]) == 0
 
 
 if __name__ == "__main__":
