@@ -99,6 +99,7 @@ from .import_formats import (
     import_yolo_v5plus,
     process_import_format,
 )
+from .review_package import export_review_package
 from .sam_utils import InferenceBusyError, SAMUtils, _run_sync
 from .slice_registration import SliceRegistrationTool
 from .snake_game import SnakeGame
@@ -302,7 +303,7 @@ class ImageAnnotator(QMainWindow):
         self.is_loading_project = False
         self.backup_project_path = None
 
-        self.setWindowTitle("Image Annotator")
+        self.setWindowTitle("Annotation Studio")
         self.setGeometry(100, 100, 1400, 800)
 
         self.central_widget = QWidget()
@@ -460,6 +461,8 @@ class ImageAnnotator(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QHBoxLayout(self.central_widget)
+        self.layout.setContentsMargins(10, 10, 10, 10)
+        self.layout.setSpacing(10)
 
         # Initialize tool group
         self.tool_group = QButtonGroup(self)
@@ -473,7 +476,7 @@ class ImageAnnotator(QMainWindow):
         self.update_ui_for_current_tool()
 
     def update_window_title(self):
-        base_title = "Image Annotator"
+        base_title = "Annotation Studio"
         if hasattr(self, "current_project_file"):
             project_name = os.path.basename(self.current_project_file)
             project_name = os.path.splitext(project_name)[
@@ -903,6 +906,8 @@ class ImageAnnotator(QMainWindow):
         self.image_list.clear()
         for image_info in self.all_images:
             self.image_list.addItem(image_info["file_name"])
+        if hasattr(self, "frame_count_label"):
+            self.frame_count_label.setText(f"{self.image_list.count()} loaded")
 
     def select_class(self, index):
         if 0 <= index < self.class_list.count():
@@ -2696,6 +2701,123 @@ class ImageAnnotator(QMainWindow):
 
         QMessageBox.information(self, "Export Complete", message)
 
+
+    def create_review_package(self):
+        """Create a small, self-contained sample for team approval."""
+        if not self.image_label.check_unsaved_changes():
+            return
+        self.save_current_annotations()
+
+        def has_real_annotations(image_name):
+            return any(
+                annotations
+                for class_name, annotations in self.all_annotations.get(
+                    image_name, {}
+                ).items()
+                if not class_name.startswith("Temp-")
+            )
+
+        ordered_names = [
+            self.image_list.item(index).text()
+            for index in range(self.image_list.count())
+            if has_real_annotations(self.image_list.item(index).text())
+        ]
+        ordered_names.extend(
+            name
+            for name in self.all_annotations
+            if name not in ordered_names and has_real_annotations(name)
+        )
+        if not ordered_names:
+            self.show_warning(
+                "Nothing to Review",
+                "Label at least one frame before creating a review package.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Choose Labels for Team Review")
+        dialog.setMinimumWidth(520)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel("Choose a small pilot batch")
+        heading.setProperty("class", "dialog-title")
+        explanation = QLabel(
+            "The first five labeled frames are selected. Adjust the selection "
+            "if needed, then create a package Hira and Lucas can review without "
+            "installing this app."
+        )
+        explanation.setWordWrap(True)
+        explanation.setProperty("class", "help-text")
+        layout.addWidget(heading)
+        layout.addWidget(explanation)
+
+        review_list = QListWidget()
+        review_list.setObjectName("reviewFrameList")
+        review_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        current_name = self.current_slice or self.image_file_name
+        default_names = ordered_names[:5]
+        if current_name in ordered_names and current_name not in default_names:
+            default_names[-1] = current_name
+        for image_name in ordered_names:
+            item = QListWidgetItem(image_name)
+            review_list.addItem(item)
+            if image_name in default_names:
+                item.setSelected(True)
+        layout.addWidget(review_list, 1)
+
+        selection_hint = QLabel(
+            "Tip: Ctrl+click adds or removes individual frames from the selection."
+        )
+        selection_hint.setProperty("class", "help-text")
+        layout.addWidget(selection_hint)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Create Package"
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected_names = [item.text() for item in review_list.selectedItems()]
+        if not selected_names:
+            self.show_warning(
+                "No Frames Selected",
+                "Select at least one labeled frame for the review package.",
+            )
+            return
+
+        output_dir = QFileDialog.getExistingDirectory(
+            self, "Choose an Empty Folder for the Review Package"
+        )
+        if not output_dir:
+            return
+        try:
+            result = export_review_package(
+                self.all_annotations,
+                self.image_label.class_colors,
+                self.image_paths,
+                self.slices,
+                self.image_slices,
+                output_dir,
+                selected_names,
+            )
+        except (OSError, ValueError) as exc:
+            self.show_warning("Review Package", str(exc))
+            return
+
+        self.show_info(
+            "Review Package Ready",
+            f"{result['frame_count']} labels were packaged for review.\n\n"
+            f"Preview in a browser:\n{result['review_path']}\n\n"
+            f"Ready-to-send ZIP:\n{result['archive_path']}",
+        )
+
     def save_slices(self, directory):
         slices_saved = False
         for image_file, image_slices in self.image_slices.items():
@@ -2757,7 +2879,8 @@ class ImageAnnotator(QMainWindow):
         # Set the background color of the entire list widget
         if self.dark_mode:
             self.slice_list.setStyleSheet(
-                "QListWidget { background-color: rgb(40, 40, 40); }"
+                "QListWidget { background-color: #0D1723; "
+                "border: 1px solid #26384E; border-radius: 8px; }"
             )
         else:
             self.slice_list.setStyleSheet(
@@ -2779,7 +2902,7 @@ class ImageAnnotator(QMainWindow):
                     item.setBackground(QColor(58, 95, 140))
                 else:
                     item.setForeground(QColor(200, 200, 200))  # Light gray text
-                    item.setBackground(QColor(40, 40, 40))  # Very dark gray background
+                    item.setBackground(QColor(13, 23, 35))
             else:
                 # Light mode
                 if slice_name in self.all_annotations and any(
@@ -3117,12 +3240,26 @@ class ImageAnnotator(QMainWindow):
 
     def setup_sidebar(self):
         self.sidebar = QWidget()
-        self.sidebar.setMinimumWidth(350)
-        self.sidebar.setMaximumWidth(470)
+        self.sidebar.setObjectName("controlPanel")
+        self.sidebar.setMinimumWidth(360)
+        self.sidebar.setMaximumWidth(450)
         self.sidebar_layout = QVBoxLayout(self.sidebar)
-        self.sidebar_layout.setContentsMargins(6, 6, 6, 6)
-        self.sidebar_layout.setSpacing(6)
+        self.sidebar_layout.setContentsMargins(12, 12, 12, 12)
+        self.sidebar_layout.setSpacing(10)
         self.layout.addWidget(self.sidebar, 1)
+
+        identity = QWidget()
+        identity.setObjectName("productIdentity")
+        identity_layout = QVBoxLayout(identity)
+        identity_layout.setContentsMargins(2, 0, 2, 4)
+        identity_layout.setSpacing(2)
+        product_title = QLabel("ANNOTATION STUDIO")
+        product_title.setProperty("class", "product-title")
+        product_subtitle = QLabel("Precise masks, frame by frame")
+        product_subtitle.setProperty("class", "product-subtitle")
+        identity_layout.addWidget(product_title)
+        identity_layout.addWidget(product_subtitle)
+        self.sidebar_layout.addWidget(identity)
 
         def help_text(text):
             label = QLabel(text)
@@ -3166,16 +3303,18 @@ class ImageAnnotator(QMainWindow):
             self.labeling_page,
             labeling_layout,
         ) = scroll_page()
-        self.sidebar_tabs.addTab(self.labeling_scroll, "Labeling")
+        self.sidebar_tabs.addTab(self.labeling_scroll, "Label")
 
         workflow_hint = QLabel(
-            "Load  >  Classes  >  Draw  >  Review  >  Export"
+            "YOUR WORKFLOW\n"
+            "Add frames  ->  choose a class  ->  draw  ->  review  ->  export"
         )
+        workflow_hint.setObjectName("labelWorkflowHint")
         workflow_hint.setProperty("class", "workflow-hint")
         workflow_hint.setWordWrap(True)
         labeling_layout.addWidget(workflow_hint)
 
-        data_group, data_layout = group("1. Data and classes")
+        data_group, data_layout = group("Start a labeling session")
 
         self.import_format_selector = QComboBox()
         self.import_format_selector.addItem("COCO JSON")
@@ -3197,6 +3336,7 @@ class ImageAnnotator(QMainWindow):
 
         self.add_images_button = QPushButton("Add New Images")
         self.add_images_button.clicked.connect(self.add_images)
+        self.add_images_button.setProperty("buttonRole", "primary")
         self.add_images_button.setToolTip("Add still images or an image sequence.")
 
         self.open_video_button = QPushButton("Open Video Clip...")
@@ -3210,14 +3350,14 @@ class ImageAnnotator(QMainWindow):
         data_layout.addLayout(load_layout)
 
         preset_layout = QHBoxLayout()
-        self.cavitar_preset_button = QPushButton("CAVITAR Preset")
+        self.cavitar_preset_button = QPushButton("Droplets only")
         self.cavitar_preset_button.clicked.connect(
             self.add_cavitar_welding_classes
         )
         self.cavitar_preset_button.setToolTip(
             "Add only molten_consumable and droplet with the agreed RGB colors."
         )
-        self.full_arc_preset_button = QPushButton("Full Arc Preset")
+        self.full_arc_preset_button = QPushButton("Droplets + arc")
         self.full_arc_preset_button.clicked.connect(
             self.add_default_welding_classes
         )
@@ -3230,9 +3370,12 @@ class ImageAnnotator(QMainWindow):
 
         self.add_class_button = QPushButton("Add Custom Class")
         self.add_class_button.clicked.connect(lambda: self.add_class())
+        self.add_class_button.setProperty("buttonRole", "quiet")
         data_layout.addWidget(self.add_class_button)
 
-        data_layout.addWidget(QLabel("Classes"))
+        class_heading = QLabel("ACTIVE LABEL CLASS")
+        class_heading.setProperty("class", "eyebrow")
+        data_layout.addWidget(class_heading)
         self.class_list = QListWidget()
         self.class_list.setMinimumHeight(90)
         self.class_list.setMaximumHeight(120)
@@ -3245,7 +3388,7 @@ class ImageAnnotator(QMainWindow):
         data_layout.addWidget(self.class_list)
         labeling_layout.addWidget(data_group)
 
-        display_group, display_group_layout = group("2. Improve visibility")
+        display_group, display_group_layout = group("Make boundaries easier to see")
         display_controls = QWidget()
         display_layout = QGridLayout(display_controls)
         display_layout.setContentsMargins(0, 0, 0, 0)
@@ -3280,6 +3423,7 @@ class ImageAnnotator(QMainWindow):
 
         self.reset_display_button = QPushButton("Reset Display")
         self.reset_display_button.clicked.connect(self.reset_display_adjustments)
+        self.reset_display_button.setProperty("buttonRole", "quiet")
         display_layout.addWidget(self.reset_display_button, 2, 0, 1, 3)
         display_group_layout.addWidget(display_controls)
         display_group_layout.addWidget(
@@ -3287,17 +3431,19 @@ class ImageAnnotator(QMainWindow):
         )
         labeling_layout.addWidget(display_group)
 
-        manual_group, manual_layout = group("3. Draw and correct")
+        manual_group, manual_layout = group("Draw or correct a mask")
 
         button_layout_top = QHBoxLayout()
-        self.polygon_button = QPushButton("Polygon")
+        self.polygon_button = QPushButton("Draw polygon")
         self.polygon_button.setCheckable(True)
+        self.polygon_button.setProperty("buttonRole", "tool")
         describe(
             self.polygon_button,
             "Click around one object boundary, then press Enter to finish the mask.",
         )
-        self.rectangle_button = QPushButton("Rectangle")
+        self.rectangle_button = QPushButton("Draw box")
         self.rectangle_button.setCheckable(True)
+        self.rectangle_button.setProperty("buttonRole", "tool")
         describe(
             self.rectangle_button,
             "Drag a rectangle around an object to create a box annotation.",
@@ -3306,15 +3452,17 @@ class ImageAnnotator(QMainWindow):
         button_layout_top.addWidget(self.rectangle_button)
 
         button_layout_bottom = QHBoxLayout()
-        self.paint_brush_button = QPushButton("Paint Brush")
+        self.paint_brush_button = QPushButton("Paint mask")
         self.paint_brush_button.setCheckable(True)
+        self.paint_brush_button.setProperty("buttonRole", "tool")
         describe(
             self.paint_brush_button,
             "Paint pixels into the selected class. Display adjustments remain "
             "preview-only while painting.",
         )
-        self.eraser_button = QPushButton("Eraser")
+        self.eraser_button = QPushButton("Erase mask")
         self.eraser_button.setCheckable(True)
+        self.eraser_button.setProperty("buttonRole", "tool")
         describe(
             self.eraser_button,
             "Remove pixels only from the selected class without changing other classes.",
@@ -3333,9 +3481,7 @@ class ImageAnnotator(QMainWindow):
         )
         labeling_layout.addWidget(manual_group)
 
-        annotations_group, annotations_layout = group(
-            "4. Current-frame annotations"
-        )
+        annotations_group, annotations_layout = group("Review this frame")
         self.annotation_list = QListWidget()
         self.annotation_list.setMinimumHeight(110)
         self.annotation_list.setMaximumHeight(150)
@@ -3358,6 +3504,7 @@ class ImageAnnotator(QMainWindow):
 
         self.delete_button = QPushButton("Delete")
         self.delete_button.clicked.connect(self.delete_selected_annotations)
+        self.delete_button.setProperty("buttonRole", "danger")
         self.merge_button = QPushButton("Merge")
         self.merge_button.clicked.connect(self.merge_annotations)
         self.change_class_button = QPushButton("Change Class")
@@ -3369,7 +3516,7 @@ class ImageAnnotator(QMainWindow):
         annotations_layout.addLayout(edit_button_layout)
         labeling_layout.addWidget(annotations_group)
 
-        export_group, export_layout = group("5. Export reviewed labels")
+        export_group, export_layout = group("Export and share")
         self.export_format_selector = QComboBox()
         self.export_format_selector.addItem("COCO JSON")
         self.export_format_selector.addItem("YOLO (v4 and earlier)")
@@ -3381,7 +3528,7 @@ class ImageAnnotator(QMainWindow):
         self.export_format_selector.addItem("Pascal VOC (BBox + Segmentation)")
         export_layout.addWidget(self.export_format_selector)
 
-        self.export_button = QPushButton("Export Annotations")
+        self.export_button = QPushButton("Export Training Labels")
         self.export_button.clicked.connect(self.export_annotations)
         self.export_button.setProperty("buttonRole", "primary")
         describe(
@@ -3389,20 +3536,30 @@ class ImageAnnotator(QMainWindow):
             "Write the reviewed labels to a folder without modifying source images.",
         )
         export_layout.addWidget(self.export_button)
+
+        self.review_package_button = QPushButton("Create Review Package")
+        self.review_package_button.clicked.connect(self.create_review_package)
+        self.review_package_button.setProperty("buttonRole", "accent")
+        describe(
+            self.review_package_button,
+            "Choose a few labeled frames and create source images, exact RGB "
+            "masks, overlays, and a review page your team can open in a browser.",
+        )
+        export_layout.addWidget(self.review_package_button)
         export_layout.addWidget(
             help_text(
-                "For ER70S-6 training masks, choose RGB Semantic Masks and "
-                "export to a new empty folder."
+                "Training export creates model-ready files. Review Package creates "
+                "an easy sample for your team to approve first."
             )
         )
         labeling_layout.addWidget(export_group)
         labeling_layout.addStretch(1)
 
         self.ai_scroll, self.ai_page, ai_layout = scroll_page()
-        self.sidebar_tabs.addTab(self.ai_scroll, "AI Assist")
+        self.sidebar_tabs.addTab(self.ai_scroll, "Auto-track")
         ai_workflow_hint = QLabel(
-            "AI ASSIST\n"
-            "1. Draw a clean mask  >  2. Prepare frames  >  3. Track and review"
+            "TRACK ACROSS FRAMES\n"
+            "Draw one clean mask  ->  prepare frames  ->  track  ->  review"
         )
         ai_workflow_hint.setObjectName("aiWorkflowHint")
         ai_workflow_hint.setProperty("cardRole", "notice")
@@ -3412,7 +3569,7 @@ class ImageAnnotator(QMainWindow):
             help_text("AI masks are suggestions, not final labels. Check every frame.")
         )
 
-        sam2_group, sam2_layout = group("SAM 2 - current image")
+        sam2_group, sam2_layout = group("Improve one frame")
         self.sam_model_selector = QComboBox()
         self.sam_model_selector.addItem("Pick a SAM Model")
         self.sam_model_selector.addItems(list(self.sam_utils.sam_models.keys()))
@@ -3434,7 +3591,7 @@ class ImageAnnotator(QMainWindow):
         )
         ai_layout.addWidget(sam2_group)
 
-        sam3_group, sam3_layout = group("SAM 3 - video propagation")
+        sam3_group, sam3_layout = group("Continue a mask through frames")
         sam3_scope = QLabel(
             "Tracks from the current frame to the end of the frames currently "
             "loaded in the Images list."
@@ -3483,7 +3640,7 @@ class ImageAnnotator(QMainWindow):
         )
         ai_layout.addWidget(sam3_group)
 
-        dino_group, dino_layout = group("Grounding DINO - object proposals")
+        dino_group, dino_layout = group("Advanced: find objects from text")
 
         self.dino_model_selector = QComboBox()
         self.dino_model_selector.addItem("Pick a DINO Model")
@@ -4367,43 +4524,98 @@ class ImageAnnotator(QMainWindow):
         self.image_label.update()
 
     def setup_image_area(self):
-        """Set up the main image area."""
+        """Set up the central annotation canvas."""
         self.image_widget = QWidget()
+        self.image_widget.setObjectName("canvasPanel")
         self.image_layout = QVBoxLayout(self.image_widget)
+        self.image_layout.setContentsMargins(0, 0, 0, 0)
+        self.image_layout.setSpacing(8)
         self.layout.addWidget(self.image_widget, 3)
 
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        canvas_header = QWidget()
+        canvas_header.setObjectName("canvasHeader")
+        canvas_header_layout = QHBoxLayout(canvas_header)
+        canvas_header_layout.setContentsMargins(14, 8, 14, 8)
+        canvas_title = QLabel("CANVAS")
+        canvas_title.setProperty("class", "eyebrow")
+        self.canvas_file_label = QLabel("Add images to begin")
+        self.canvas_file_label.setProperty("class", "canvas-file")
+        shortcut_hint = QLabel("A / D  previous / next frame")
+        shortcut_hint.setProperty("class", "shortcut-pill")
+        canvas_header_layout.addWidget(canvas_title)
+        canvas_header_layout.addWidget(self.canvas_file_label)
+        canvas_header_layout.addStretch(1)
+        canvas_header_layout.addWidget(shortcut_hint)
+        self.image_layout.addWidget(canvas_header)
 
-        # Use the already initialized image_label
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName("canvasViewport")
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll_area.setWidget(self.image_label)
-
         self.image_layout.addWidget(self.scroll_area)
 
+        canvas_footer = QWidget()
+        canvas_footer.setObjectName("canvasFooter")
+        footer_layout = QHBoxLayout(canvas_footer)
+        footer_layout.setContentsMargins(12, 6, 12, 6)
+        footer_layout.setSpacing(10)
+        zoom_label = QLabel("ZOOM")
+        zoom_label.setProperty("class", "eyebrow")
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setMinimum(10)
         self.zoom_slider.setMaximum(500)
         self.zoom_slider.setValue(100)
-        self.zoom_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.zoom_slider.setTickInterval(50)
         self.zoom_slider.valueChanged.connect(self.zoom_image)
-        self.image_layout.addWidget(self.zoom_slider)
+        self.zoom_value_label = QLabel("100%")
+        self.zoom_value_label.setObjectName("zoomValueLabel")
+        self.zoom_slider.valueChanged.connect(
+            lambda value: self.zoom_value_label.setText(f"{value}%")
+        )
         self.image_info_label = QLabel()
-        self.image_layout.addWidget(self.image_info_label)
+        self.image_info_label.setProperty("class", "muted")
+        footer_layout.addWidget(zoom_label)
+        footer_layout.addWidget(self.zoom_slider, 1)
+        footer_layout.addWidget(self.zoom_value_label)
+        footer_layout.addSpacing(12)
+        footer_layout.addWidget(self.image_info_label)
+        self.image_layout.addWidget(canvas_footer)
 
     def setup_image_list(self):
-        """Set up the image list area."""
+        """Set up the frame navigator."""
         self.image_list_widget = QWidget()
+        self.image_list_widget.setObjectName("framesPanel")
+        self.image_list_widget.setMinimumWidth(230)
+        self.image_list_widget.setMaximumWidth(330)
         self.image_list_layout = QVBoxLayout(self.image_list_widget)
+        self.image_list_layout.setContentsMargins(12, 12, 12, 12)
+        self.image_list_layout.setSpacing(8)
         self.layout.addWidget(self.image_list_widget, 1)
 
-        self.image_list_label = QLabel("Images:")
-        self.image_list_layout.addWidget(self.image_list_label)
+        frames_heading = QLabel("FRAMES")
+        frames_heading.setProperty("class", "eyebrow")
+        self.frame_count_label = QLabel("0 loaded")
+        self.frame_count_label.setProperty("class", "panel-count")
+        heading_row = QHBoxLayout()
+        heading_row.addWidget(frames_heading)
+        heading_row.addStretch(1)
+        heading_row.addWidget(self.frame_count_label)
+        self.image_list_layout.addLayout(heading_row)
+
+        frames_help = QLabel("Choose a frame to label. Use A and D to move quickly.")
+        frames_help.setWordWrap(True)
+        frames_help.setProperty("class", "help-text")
+        self.image_list_layout.addWidget(frames_help)
 
         self.image_list = QListWidget()
+        self.image_list.setObjectName("frameList")
         self.image_list.itemClicked.connect(self.switch_image)
         self.image_list.currentRowChanged.connect(
             lambda row: self.switch_image(self.image_list.currentItem())
@@ -4412,8 +4624,9 @@ class ImageAnnotator(QMainWindow):
         self.image_list.customContextMenuRequested.connect(self.show_image_context_menu)
         self.image_list_layout.addWidget(self.image_list)
 
-        self.clear_all_button = QPushButton("Clear All Images and Annotations")
+        self.clear_all_button = QPushButton("Clear Workspace")
         self.clear_all_button.clicked.connect(self.clear_all)
+        self.clear_all_button.setProperty("buttonRole", "danger")
         self.image_list_layout.addWidget(self.clear_all_button)
 
     ##########    ### Tools  ########## I love useful image processing tools :)
@@ -4603,6 +4816,12 @@ class ImageAnnotator(QMainWindow):
         QMessageBox.information(self, title, message)
 
     def update_image_info(self, additional_info=None):
+        if hasattr(self, "frame_count_label"):
+            self.frame_count_label.setText(f"{self.image_list.count()} loaded")
+        if hasattr(self, "canvas_file_label"):
+            self.canvas_file_label.setText(
+                self.current_slice or self.image_file_name or "Add images to begin"
+            )
         if self.current_image:
             width = self.current_image.width()
             height = self.current_image.height()
@@ -5538,6 +5757,10 @@ class ImageAnnotator(QMainWindow):
         if current:
             self.current_class = current.text()
             print(f"Class selected: {self.current_class}")
+            if hasattr(self, "canvas_file_label"):
+                self.canvas_file_label.setToolTip(
+                    f"Active class: {self.current_class}"
+                )
 
             if self.current_class.startswith("Temp-"):
                 self.disable_annotation_tools()
@@ -5545,6 +5768,10 @@ class ImageAnnotator(QMainWindow):
                 self.enable_annotation_tools()
         else:
             self.current_class = None
+            if hasattr(self, "canvas_file_label"):
+                self.canvas_file_label.setToolTip(
+                    "Choose a class before drawing."
+                )
             self.disable_annotation_tools()
 
     def disable_annotation_tools(self):

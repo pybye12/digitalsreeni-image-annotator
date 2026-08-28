@@ -20,8 +20,9 @@ uploaded by the application.
 - Save work as an `.iap` project and continue later.
 - Export COCO, YOLO segmentation, Pascal VOC, class-ID masks, or RGB masks.
 - Keep custom classes for general datasets or apply the included ER70S-6 presets.
-- Keep everyday labeling tools separate from optional models with Labeling and
-  AI Assist tabs.
+- Use the guided **Label** and **Auto-track** workspaces without model jargon.
+- Create a team review package with source frames, exact RGB masks, overlays,
+  and a browser page before labeling an entire dataset.
 
 ## What This Fork Adds
 
@@ -31,7 +32,7 @@ uploaded by the application.
 | Large videos | Image-oriented workflow | Select start/end frames and stride; decode one frame at a time |
 | Navigation | Image list | Video sessions, source-frame numbers, and `A`/`D` frame navigation |
 | Assisted labeling | SAM 2 on individual images | Optional SAM 3 forward mask propagation from a selected polygon |
-| Review | Standard image display | Non-destructive brightness and contrast controls |
+| Review | Standard image display | Non-destructive display controls and shareable review packages |
 | Welding setup | User-created classes | ER70S-6 Full Arc and CAVITAR class/color presets |
 | Export | Existing annotation formats | Strict multiclass RGB masks, blank masks, overlap checks, and safe staged export |
 | Reliability | Upstream behavior | Automated unit, UI, and integration tests for the added workflows |
@@ -95,8 +96,10 @@ sreeni
 7. Select a class before using **Eraser**. It corrects only that class, so a
    nearby class is not accidentally removed.
 8. Save the project regularly.
-9. Select an export format and click **Export Annotations**. Use a new empty
-   folder when exporting RGB semantic masks.
+9. Select an export format and click **Export Training Labels**. Use a new
+   empty folder when exporting RGB semantic masks.
+10. Before a full labeling run, click **Create Review Package**, choose about
+    five labeled frames, and send the generated `.zip` file to the reviewer.
 
 ### ER70S-6 presets
 
@@ -131,9 +134,9 @@ checkpoint when prompted. Then:
 
 1. Draw a polygon on a clear starting frame.
 2. Click that polygon in the **Annotations** list.
-3. Open the **AI Assist** tab.
-4. Click **Load Video Frames to SAM 3**.
-5. Click **Track Selected Forward**.
+3. Open the **Auto-track** tab.
+4. Click **1. Prepare Loaded Frames**.
+5. Click **2. Track Selected to End**.
 6. Review all generated masks and fix drift with the manual tools.
 
 If the app reports **No valid polygon annotations selected**, select the
