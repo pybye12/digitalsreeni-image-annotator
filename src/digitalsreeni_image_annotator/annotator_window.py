@@ -20,6 +20,7 @@ from PyQt6.QtCore import (
     QStandardPaths,
     Qt,
     QThread,
+    QSize,
     QTimer,
     pyqtSignal,
 )
@@ -45,6 +46,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -62,6 +64,10 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSlider,
     QTabWidget,
+    QStackedWidget,
+    QToolButton,
+    QListView,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -70,7 +76,9 @@ from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
 from tifffile import TiffFile
+from .annotation_history import AnnotationHistory
 
+from .mask_propagation import interpolate_annotations, propagate_annotations
 from .annotation_statistics import show_annotation_statistics, summarize_annotations
 from .coco_json_combiner import show_coco_json_combiner
 from .dino_phrase_editor import ClassThresholdTable, PhraseEditorPanel
@@ -104,6 +112,9 @@ from .sam_utils import InferenceBusyError, SAMUtils, _run_sync
 from .slice_registration import SliceRegistrationTool
 from .snake_game import SnakeGame
 from .soft_dark_stylesheet import soft_dark_stylesheet
+from .studio_widgets import DropZone, ShortcutOverlay
+from .theme import CLASS_PANEL_WIDTH, FILMSTRIP_HEIGHT, TOOL_RAIL_WIDTH, TOP_BAR_HEIGHT, studio_stylesheet
+from .workflow_metrics import WorkflowMetrics
 from .stack_interpolator import StackInterpolator
 from .stack_to_slices import show_stack_to_slices
 from .utils import calculate_area, calculate_bbox
@@ -296,6 +307,27 @@ class _DINOReviewEventFilter(QObject):
         return True
 
 
+class _WorkflowEventFilter(QObject):
+    """Measure the annotation loop without changing event delivery."""
+
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self.main_window = main_window
+
+    def eventFilter(self, obj, event):
+        frame_name = (
+            self.main_window.current_slice or self.main_window.image_file_name
+        )
+        if frame_name:
+            self.main_window.workflow_metrics.enter_frame(frame_name)
+        if event.type() == QEvent.Type.MouseMove:
+            position = event.position()
+            self.main_window.workflow_metrics.mouse_move(position.x(), position.y())
+        elif event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress):
+            self.main_window.workflow_metrics.action()
+        return False
+
+
 class ImageAnnotator(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -326,6 +358,12 @@ class ImageAnnotator(QMainWindow):
         self.current_class = None
         self.image_file_name = ""
         self.all_annotations = {}
+        self.annotation_history = AnnotationHistory(limit=40)
+        self.workflow_metrics = WorkflowMetrics()
+        self._history_suspended = False
+        self._last_saved_at = None
+        self._propagation_enabled = True
+        self._overlay_opacity = 0.5
         self.all_images = []
         self.image_paths = {}
         self.loaded_json = None
@@ -398,6 +436,10 @@ class ImageAnnotator(QMainWindow):
 
         # Setup UI components
         self.setup_ui()
+        self._workflow_filter = _WorkflowEventFilter(self)
+        self.image_label.setMouseTracking(True)
+        self.image_label.installEventFilter(self._workflow_filter)
+
 
         # Apply theme and font (this includes stylesheet and font size application)
         self.apply_theme_and_font()
@@ -410,6 +452,7 @@ class ImageAnnotator(QMainWindow):
         # YOLO Trainer
         self.yolo_trainer = None
         self.setup_yolo_menu()
+        self._build_studio_menus()
 
         self.frame_sequence = None
         self.video_sessions = {}
@@ -432,7 +475,7 @@ class ImageAnnotator(QMainWindow):
         self._video_shortcuts = []
         for key, callback in (
             ("A", self.go_to_previous_frame),
-            ("D", self.go_to_next_frame),
+            ("D", self.accept_and_go_to_next_frame),
             ("C", self.copy_selected_annotation_to_next_frame),
         ):
             shortcut = QShortcut(QKeySequence(key), self)
@@ -441,6 +484,25 @@ class ImageAnnotator(QMainWindow):
                 lambda callback=callback: self._trigger_video_shortcut(callback)
             )
             self._video_shortcuts.append(shortcut)
+        self._studio_shortcuts = []
+        for key, callback in (
+            ("P", self.polygon_button.click),
+            ("R", self.rectangle_button.click),
+            ("B", self.paint_brush_button.click),
+            ("E", self.eraser_button.click),
+            ("[", lambda: self.adjust_overlay_opacity(-0.1)),
+            ("]", lambda: self.adjust_overlay_opacity(0.1)),
+        ):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(callback)
+            self._studio_shortcuts.append(shortcut)
+        for index in range(9):
+            shortcut = QShortcut(QKeySequence(str(index + 1)), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(lambda index=index: self.select_class(index))
+            self._studio_shortcuts.append(shortcut)
+
 
         # Enter/Escape for DINO temp_annotations need to work even when
         # focus is on slice_list / image_list / a button — none of which
@@ -473,8 +535,386 @@ class ImageAnnotator(QMainWindow):
         self.setup_image_area()
         self.setup_image_list()
         self.setup_slice_list()
+        self.setup_studio_shell()
         self.update_ui_for_current_tool()
 
+    def setup_studio_shell(self):
+        """Recompose the existing controls into a canvas-first workspace."""
+        root = QWidget()
+        root.setObjectName("studioRoot")
+
+        # Keep every mature control alive while replacing only its presentation.
+        self.sidebar.setParent(root)
+        self.image_widget.setParent(root)
+        self.image_list_widget.setParent(root)
+        self.sidebar.hide()
+        self.image_list_widget.hide()
+        self.setCentralWidget(root)
+        self.central_widget = root
+
+        self.layout = QVBoxLayout(root)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+        self.top_bar = QWidget()
+        self.top_bar.setObjectName("topBar")
+        self.top_bar.setFixedHeight(TOP_BAR_HEIGHT)
+        top = QHBoxLayout(self.top_bar)
+        top.setContentsMargins(12, 4, 10, 4)
+        top.setSpacing(9)
+        app_title = QLabel("Annotation Studio")
+        app_title.setProperty("uiRole", "appTitle")
+        self.studio_project_label = QLabel("Untitled project")
+        self.studio_project_label.setProperty("uiRole", "muted")
+        self.studio_progress = QProgressBar()
+        self.studio_progress.setRange(0, 100)
+        self.studio_progress.setValue(0)
+        self.studio_progress.setFixedWidth(130)
+        self.studio_progress.setTextVisible(False)
+        self.studio_progress_label = QLabel("0 / 0 labeled")
+        self.studio_progress_label.setProperty("uiRole", "muted")
+        self.studio_eta_label = QLabel("")
+        self.studio_eta_label.setProperty("uiRole", "subtle")
+        self.saved_status_label = QLabel("Saved")
+        self.saved_status_label.setProperty("uiRole", "saved")
+        self.export_button.setText("Export")
+        self.review_package_button.setText("Review sample")
+        top.addWidget(app_title)
+        top.addWidget(self.studio_project_label)
+        top.addSpacing(12)
+        top.addWidget(self.studio_progress)
+        top.addWidget(self.studio_progress_label)
+        top.addWidget(self.studio_eta_label)
+        top.addStretch(1)
+        top.addWidget(self.saved_status_label)
+        top.addWidget(self.review_package_button)
+        top.addWidget(self.export_button)
+        self.layout.addWidget(self.top_bar)
+
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+
+        self.tool_rail = QWidget()
+        self.tool_rail.setObjectName("toolRail")
+        self.tool_rail.setFixedWidth(TOOL_RAIL_WIDTH)
+        rail = QVBoxLayout(self.tool_rail)
+        rail.setContentsMargins(7, 9, 7, 9)
+        rail.setSpacing(4)
+        tool_specs = (
+            (self.polygon_button, "P", "Polygon (P): click around the boundary, then press Enter."),
+            (self.rectangle_button, "R", "Rectangle (R): drag a bounding box."),
+            (self.paint_brush_button, "B", "Brush (B): paint the active class."),
+            (self.eraser_button, "E", "Eraser (E): remove pixels from the active class."),
+            (self.sam_points_button, "S", "Segment points: use positive and negative prompts."),
+        )
+        self.rail_tool_buttons = []
+        for button, text_value, tooltip in tool_specs:
+            button.setText(text_value)
+            button.setToolTip(tooltip)
+            button.setProperty("rail", True)
+            button.setFixedSize(40, 40)
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            rail.addWidget(button)
+            self.rail_tool_buttons.append(button)
+
+        self.track_drawer_button = QToolButton()
+        self.track_drawer_button.setText("T")
+        self.track_drawer_button.setToolTip("Tracking tools: propagate masks through a frame sequence.")
+        self.track_drawer_button.setProperty("rail", True)
+        self.track_drawer_button.setCheckable(True)
+        self.track_drawer_button.setFixedSize(40, 40)
+        rail.addWidget(self.track_drawer_button)
+        rail.addStretch(1)
+
+        self.display_button = QToolButton()
+        self.display_button.setText("L")
+        self.display_button.setToolTip("Lighting: preview brightness and contrast.")
+        self.display_button.setProperty("rail", True)
+        self.display_button.setFixedSize(40, 40)
+        rail.addWidget(self.display_button)
+        self.shortcut_button = QToolButton()
+        self.shortcut_button.setText("?")
+        self.shortcut_button.setToolTip("Keyboard shortcuts")
+        self.shortcut_button.setProperty("rail", True)
+        self.shortcut_button.setFixedSize(40, 40)
+        rail.addWidget(self.shortcut_button)
+        body_layout.addWidget(self.tool_rail)
+
+        # Empty projects get one calm drop target instead of a disabled canvas.
+        scroll_index = self.image_layout.indexOf(self.scroll_area)
+        self.image_layout.takeAt(scroll_index)
+        self.canvas_stack = QStackedWidget()
+        self.empty_drop_zone = DropZone()
+        self.empty_drop_zone.browse_requested.connect(self.add_images)
+        self.empty_drop_zone.import_requested.connect(self.import_annotations)
+        self.empty_drop_zone.files_dropped.connect(self._handle_studio_drop)
+        self.canvas_stack.addWidget(self.empty_drop_zone)
+        self.canvas_stack.addWidget(self.scroll_area)
+        self.image_layout.insertWidget(scroll_index, self.canvas_stack, 1)
+
+        self.tracking_drawer = QWidget()
+        self.tracking_drawer.setObjectName("trackingDrawer")
+        tracking = QHBoxLayout(self.tracking_drawer)
+        tracking.setContentsMargins(10, 8, 10, 8)
+        tracking.setSpacing(7)
+        tracking_title = QLabel("TRACK")
+        tracking_title.setProperty("uiRole", "section")
+        self.sam3_init_btn.setText("Prepare sequence")
+        self.sam3_track_forward_btn.setText("Track selected")
+        self.sam3_track_all_btn.setText("Track all")
+        tracking.addWidget(tracking_title)
+        tracking.addWidget(self.sam3_init_btn)
+        tracking.addWidget(self.sam3_track_forward_btn)
+        tracking.addWidget(self.sam3_track_all_btn)
+        tracking.addStretch(1)
+        self.tracking_drawer.hide()
+        self.track_drawer_button.toggled.connect(self.tracking_drawer.setVisible)
+
+        canvas_column = QWidget()
+        canvas_layout = QVBoxLayout(canvas_column)
+        canvas_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_layout.setSpacing(0)
+        canvas_layout.addWidget(self.tracking_drawer)
+        canvas_layout.addWidget(self.image_widget, 1)
+        body_layout.addWidget(canvas_column, 1)
+
+        self.class_panel = QWidget()
+        self.class_panel.setObjectName("classPanel")
+        self.class_panel.setFixedWidth(CLASS_PANEL_WIDTH)
+        panel = QVBoxLayout(self.class_panel)
+        panel.setContentsMargins(12, 12, 12, 12)
+        panel.setSpacing(8)
+        class_header = QHBoxLayout()
+        classes_title = QLabel("CLASSES")
+        classes_title.setProperty("uiRole", "section")
+        self.class_summary_label = QLabel("0 classes")
+        self.class_summary_label.setProperty("uiRole", "muted")
+        self.add_class_button.setText("+")
+        self.add_class_button.setToolTip("Add a custom class")
+        self.add_class_button.setFixedWidth(34)
+        class_header.addWidget(classes_title)
+        class_header.addStretch(1)
+        class_header.addWidget(self.class_summary_label)
+        class_header.addWidget(self.add_class_button)
+        panel.addLayout(class_header)
+        self.class_list.setMinimumHeight(150)
+        self.class_list.setMaximumHeight(16777215)
+        panel.addWidget(self.class_list, 2)
+
+        annotations_title = QLabel("OBJECTS ON THIS FRAME")
+        annotations_title.setProperty("uiRole", "section")
+        panel.addWidget(annotations_title)
+        self.annotation_list.setMinimumHeight(100)
+        self.annotation_list.setMaximumHeight(16777215)
+        panel.addWidget(self.annotation_list, 1)
+        edit_row = QHBoxLayout()
+        self.delete_button.setText("Delete")
+        self.merge_button.setText("Merge")
+        self.change_class_button.setText("Reclass")
+        edit_row.addWidget(self.delete_button)
+        edit_row.addWidget(self.merge_button)
+        edit_row.addWidget(self.change_class_button)
+        panel.addLayout(edit_row)
+        panel.addStretch(0)
+        body_layout.addWidget(self.class_panel)
+        self.layout.addWidget(body, 1)
+
+        self.filmstrip_panel = QWidget()
+        self.filmstrip_panel.setObjectName("filmstripPanel")
+        self.filmstrip_panel.setFixedHeight(FILMSTRIP_HEIGHT)
+        filmstrip_layout = QVBoxLayout(self.filmstrip_panel)
+        filmstrip_layout.setContentsMargins(8, 5, 8, 5)
+        filmstrip_layout.setSpacing(3)
+        filmstrip_header = QHBoxLayout()
+        filmstrip_title = QLabel("FRAMES")
+        filmstrip_title.setProperty("uiRole", "section")
+        self.frame_count_label.setProperty("uiRole", "muted")
+        filmstrip_header.addWidget(filmstrip_title)
+        filmstrip_header.addWidget(self.frame_count_label)
+        filmstrip_header.addStretch(1)
+        self.interpolate_button = QPushButton("Interpolate keyframes")
+        self.interpolate_button.setToolTip("Select two labeled frames to fill empty frames between them.")
+        self.interpolate_button.clicked.connect(self.interpolate_selected_keyframes)
+        filmstrip_header.addWidget(self.interpolate_button)
+        filmstrip_header.addWidget(QLabel("A previous   D accept + next"))
+        filmstrip_layout.addLayout(filmstrip_header)
+        self.image_list.setViewMode(QListView.ViewMode.IconMode)
+        self.image_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.image_list.setFlow(QListView.Flow.LeftToRight)
+        self.image_list.setWrapping(False)
+        self.image_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.image_list.setMovement(QListView.Movement.Static)
+        self.image_list.setIconSize(QSize(88, 50))
+        self.image_list.setGridSize(QSize(116, 70))
+        self.image_list.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.image_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        filmstrip_layout.addWidget(self.image_list)
+        self.layout.addWidget(self.filmstrip_panel)
+
+        self.brightness_popover = QWidget(self, Qt.WindowType.Popup)
+        self.brightness_popover.setObjectName("brightnessPopover")
+        display_layout = QGridLayout(self.brightness_popover)
+        display_layout.setContentsMargins(14, 12, 14, 12)
+        display_layout.addWidget(QLabel("Brightness"), 0, 0)
+        display_layout.addWidget(self.brightness_slider, 0, 1)
+        display_layout.addWidget(self.brightness_value_label, 0, 2)
+        display_layout.addWidget(QLabel("Contrast"), 1, 0)
+        display_layout.addWidget(self.contrast_slider, 1, 1)
+        display_layout.addWidget(self.contrast_value_label, 1, 2)
+        display_layout.addWidget(self.reset_display_button, 2, 0, 1, 3)
+        self.display_button.clicked.connect(self._show_brightness_popover)
+
+        self.shortcut_overlay = ShortcutOverlay(self)
+        self.shortcut_button.clicked.connect(self._show_shortcut_overlay)
+        self.image_list.model().rowsInserted.connect(self.refresh_studio_state)
+        self.image_list.model().rowsRemoved.connect(self.refresh_studio_state)
+        self.image_list.model().modelReset.connect(self.refresh_studio_state)
+        self.refresh_studio_state()
+
+    def _handle_studio_drop(self, paths):
+        images = [
+            path for path in paths
+            if Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".czi"}
+        ]
+        if images:
+            self.add_images_to_list(images)
+            return
+        self.show_warning(
+            "Open Video",
+            "Use File > Open Video Clip to choose a safe frame range from a video.",
+        )
+
+    def _show_brightness_popover(self):
+        position = self.display_button.mapToGlobal(
+            self.display_button.rect().topRight()
+        )
+        self.brightness_popover.adjustSize()
+        self.brightness_popover.move(position)
+        self.brightness_popover.show()
+
+    def _show_shortcut_overlay(self):
+        position = self.shortcut_button.mapToGlobal(
+            self.shortcut_button.rect().topRight()
+        )
+        self.shortcut_overlay.adjustSize()
+        self.shortcut_overlay.move(position)
+        self.shortcut_overlay.show()
+
+    def _build_studio_menus(self):
+        menu_bar = self.menuBar()
+        menu_bar.clear()
+
+        file_menu = menu_bar.addMenu("&File")
+        for text_value, shortcut, callback in (
+            ("New Project", QKeySequence.StandardKey.New, self.new_project),
+            ("Open Project", QKeySequence.StandardKey.Open, self.open_project),
+            ("Add Images", None, self.add_images),
+            ("Open Video Clip", None, self.open_video_clip),
+            ("Save", QKeySequence.StandardKey.Save, self.save_project),
+            ("Export Labels", None, self.export_annotations),
+            ("Create Review Sample", None, self.create_review_package),
+        ):
+            action = QAction(text_value, self)
+            if shortcut:
+                action.setShortcut(shortcut)
+            action.triggered.connect(callback)
+            file_menu.addAction(action)
+        file_menu.addSeparator()
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(QApplication.quit)
+        file_menu.addAction(quit_action)
+
+        edit_menu = menu_bar.addMenu("&Edit")
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        undo_action.triggered.connect(self.undo_annotations)
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        redo_action.triggered.connect(self.redo_annotations)
+        edit_menu.addAction(undo_action)
+        edit_menu.addAction(redo_action)
+        edit_menu.addSeparator()
+        add_class_action = QAction("Add Class", self)
+        add_class_action.triggered.connect(self.add_class)
+        edit_menu.addAction(add_class_action)
+        statistics_action = QAction("Annotation Statistics", self)
+        statistics_action.triggered.connect(self.show_annotation_statistics)
+        edit_menu.addAction(statistics_action)
+
+        view_menu = menu_bar.addMenu("&View")
+        lighting_action = QAction("Brightness and Contrast", self)
+        lighting_action.triggered.connect(self._show_brightness_popover)
+        view_menu.addAction(lighting_action)
+        shortcuts_action = QAction("Keyboard Shortcuts", self)
+        shortcuts_action.setShortcut(QKeySequence("?"))
+        shortcuts_action.triggered.connect(self._show_shortcut_overlay)
+        view_menu.addAction(shortcuts_action)
+        metrics_action = QAction("Session Metrics", self)
+        metrics_action.triggered.connect(self.show_workflow_metrics)
+        view_menu.addAction(metrics_action)
+        theme_action = QAction("Toggle Theme", self)
+        theme_action.triggered.connect(self.toggle_dark_mode)
+        view_menu.addAction(theme_action)
+
+        help_menu = menu_bar.addMenu("&Help")
+        help_action = QAction("User Guide", self)
+        help_action.triggered.connect(self.show_help)
+        help_menu.addAction(help_action)
+        protocol_action = QAction("ER70S-6 Labeling Protocol", self)
+        protocol_action.triggered.connect(self.show_er70s6_protocol)
+        help_menu.addAction(protocol_action)
+
+    def refresh_studio_state(self, *args):
+        count = self.image_list.count()
+        labeled = sum(
+            1 for image in self.all_images
+            if any(self.all_annotations.get(image.get("file_name"), {}).values())
+        )
+        self.frame_count_label.setText(f"{count} loaded")
+        self.studio_progress_label.setText(f"{labeled} / {count} labeled")
+        self.studio_progress.setValue(round(100 * labeled / count) if count else 0)
+        remaining = max(0, count - labeled)
+        eta = self.workflow_metrics.eta_seconds(remaining)
+        self.studio_eta_label.setText(
+            f"~{max(1, round(eta / 60))} min left" if eta >= 30 else ""
+        )
+        self.class_summary_label.setText(
+            f"{self.class_list.count()} classes"
+        )
+        project_file = getattr(self, "current_project_file", "")
+        self.studio_project_label.setText(
+            Path(project_file).stem if project_file else "Untitled project"
+        )
+        has_frames = count > 0
+        self.canvas_stack.setCurrentIndex(1 if has_frames else 0)
+        self.tool_rail.setEnabled(has_frames)
+        self.class_panel.setEnabled(has_frames)
+        self.filmstrip_panel.setEnabled(has_frames)
+        self.export_button.setEnabled(has_frames)
+        self.review_package_button.setEnabled(has_frames)
+        for index in range(count):
+            item = self.image_list.item(index)
+            image_path = self.image_paths.get(item.text())
+            if image_path and item.data(Qt.ItemDataRole.UserRole + 7) != image_path:
+                pixmap = QPixmap(image_path)
+                if not pixmap.isNull():
+                    item.setIcon(
+                        QIcon(
+                            pixmap.scaled(
+                                88,
+                                50,
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation,
+                            )
+                        )
+                    )
+                    item.setData(Qt.ItemDataRole.UserRole + 7, image_path)
+            if any(self.all_annotations.get(item.text(), {}).values()):
+                item.setToolTip(f"{item.text()} - labeled")
+            else:
+                item.setToolTip(f"{item.text()} - not labeled")
     def update_window_title(self):
         base_title = "Annotation Studio"
         if hasattr(self, "current_project_file"):
@@ -671,6 +1111,7 @@ class ImageAnnotator(QMainWindow):
         """Load project data without triggering auto-saves."""
         self._reset_sam3_video_state()
         self._clear_video_sessions(clean_clip_caches=True)
+        self.annotation_history.clear()
         loaded_sessions = copy.deepcopy(project_data.get("video_sessions", {}))
         self.video_sessions = (
             loaded_sessions if isinstance(loaded_sessions, dict) else {}
@@ -775,17 +1216,38 @@ class ImageAnnotator(QMainWindow):
 
         self._restore_active_frame_sequence()
 
-        # Select the first image if available
+        # Restore the last review position and display settings.
+        ui_state = project_data.get("ui_state", {})
+        target_name = ui_state.get("current_frame")
+        target_items = (
+            self.image_list.findItems(target_name, Qt.MatchFlag.MatchExactly)
+            if target_name
+            else []
+        )
         if self.image_list.count() > 0:
-            self.image_list.setCurrentRow(0)
-            first_item = self.image_list.item(0)
-            if first_item:
-                self.switch_image(first_item)
+            target_item = target_items[0] if target_items else self.image_list.item(0)
+            self.image_list.setCurrentItem(target_item)
+            self.switch_image(target_item)
 
-        # Select the first class if available
+        target_class = ui_state.get("active_class")
+        class_items = (
+            self.class_list.findItems(target_class, Qt.MatchFlag.MatchExactly)
+            if target_class
+            else []
+        )
         if self.class_list.count() > 0:
-            self.class_list.setCurrentRow(0)
+            self.class_list.setCurrentItem(
+                class_items[0] if class_items else self.class_list.item(0)
+            )
             self.on_class_selected()
+
+        self.brightness_slider.setValue(int(ui_state.get("brightness", 0)))
+        self.contrast_slider.setValue(int(ui_state.get("contrast", 0)))
+        self.set_zoom(float(ui_state.get("zoom", 100)) / 100.0)
+        self._overlay_opacity = float(ui_state.get("overlay_opacity", 0.5))
+        self.image_label.fill_opacity = self._overlay_opacity
+        self._propagation_enabled = bool(ui_state.get("propagation_enabled", True))
+        self.refresh_studio_state()
 
     def handle_missing_images(self, missing_images):
         message = "The following images have annotations but were not found in the project directory:\n\n"
@@ -1186,6 +1648,15 @@ class ImageAnnotator(QMainWindow):
                 self, "project_creation_date", datetime.now().isoformat()
             ),
             "last_modified": datetime.now().isoformat(),
+            "ui_state": {
+                "current_frame": self.current_slice or self.image_file_name,
+                "active_class": self.current_class,
+                "zoom": self.zoom_slider.value(),
+                "brightness": self.brightness_slider.value(),
+                "contrast": self.contrast_slider.value(),
+                "overlay_opacity": self._overlay_opacity,
+                "propagation_enabled": self._propagation_enabled,
+            },
         }
 
         # Persist DINO configuration by snapshotting the widgets that own it.
@@ -1283,6 +1754,18 @@ class ImageAnnotator(QMainWindow):
             if original_project_file is None:
                 self.current_project_file = new_project_file
 
+    def _mark_auto_saved(self):
+        self._last_saved_at = datetime.now()
+        if hasattr(self, "saved_status_label"):
+            self.saved_status_label.setProperty("uiRole", "saved")
+            self.saved_status_label.setText(
+                f"Saved {self._last_saved_at.strftime('%H:%M:%S')}"
+            )
+            self.saved_status_label.style().unpolish(self.saved_status_label)
+            self.saved_status_label.style().polish(self.saved_status_label)
+        if hasattr(self, "refresh_studio_state"):
+            self.refresh_studio_state()
+
     def auto_save(self):
         if self.is_loading_project:
             return False
@@ -1299,6 +1782,7 @@ class ImageAnnotator(QMainWindow):
                 saved = self.save_project()
                 if saved:
                     print("Project auto-saved.")
+                    self._mark_auto_saved()
                 return saved
             else:
                 return False
@@ -1307,6 +1791,7 @@ class ImageAnnotator(QMainWindow):
             saved = self.save_project(show_message=False)
             if saved:
                 print("Project auto-saved.")
+                self._mark_auto_saved()
             return saved
         return False
 
@@ -1563,6 +2048,7 @@ class ImageAnnotator(QMainWindow):
             ).append(new_annotation)
             self.add_annotation_to_list(new_annotation)
             self.save_current_annotations()
+            self.auto_save()
             self.update_slice_list_colors()
             self.image_label.temp_sam_prediction = None
             # --- Clear points after accepting
@@ -1671,6 +2157,8 @@ class ImageAnnotator(QMainWindow):
         if first_added_item:
             self.image_list.setCurrentItem(first_added_item)
             self.switch_image(first_added_item)
+
+        self.refresh_studio_state()
 
         if auto_save and not self.is_loading_project:
             self.auto_save()
@@ -2960,17 +3448,28 @@ class ImageAnnotator(QMainWindow):
             # print("Error: No current slice or image file name set")
             return
 
+        previous_state = copy.deepcopy(self.all_annotations)
         # print(f"Saving annotations for: {current_name}")
         if self.image_label.annotations:
-            self.all_annotations[current_name] = self.image_label.annotations.copy()
+            self.all_annotations[current_name] = copy.deepcopy(
+                self.image_label.annotations
+            )
             # print(f"Saved {len(self.image_label.annotations)} annotations for {current_name}")
         elif current_name in self.all_annotations:
             del self.all_annotations[current_name]
             # print(f"Removed annotations for {current_name}")
 
+        if (
+            not self._history_suspended
+            and previous_state != self.all_annotations
+        ):
+            self.annotation_history.record(previous_state, "annotation edit")
+
         self.update_slice_list_colors()
 
         # print(f"All annotations now: {self.all_annotations.keys()}")
+        if hasattr(self, "refresh_studio_state"):
+            self.refresh_studio_state()
         # print(f"Current slice: {self.current_slice}")
         # print(f"Current image_file_name: {self.image_file_name}")
 
@@ -4479,14 +4978,10 @@ class ImageAnnotator(QMainWindow):
 
     def apply_theme_and_font(self):
         font_size = self.font_sizes[self.current_font_size]
-        if self.dark_mode:
-            style = soft_dark_stylesheet
-        else:
-            style = default_stylesheet
-
-        # Combine the theme stylesheet with font size
-        combined_style = f"{style}\nQWidget {{ font-size: {font_size}pt; }}"
-        self.setStyleSheet(combined_style)
+        style = (
+            studio_stylesheet(font_size) if self.dark_mode else default_stylesheet
+        )
+        self.setStyleSheet(style)
 
         # Apply font size to all widgets
         for widget in self.findChildren(QWidget):
@@ -7383,6 +7878,203 @@ class ImageAnnotator(QMainWindow):
             self.image_list.setCurrentItem(next_item)
             self.switch_image(next_item)
 
+    def interpolate_selected_keyframes(self):
+        selected = sorted(
+            (self.image_list.row(item), item.text())
+            for item in self.image_list.selectedItems()
+        )
+        if len(selected) != 2:
+            self.show_warning(
+                "Interpolate Keyframes",
+                "Select exactly two labeled frames in the filmstrip.",
+            )
+            return
+        (first_row, first_name), (second_row, second_name) = selected
+        if second_row - first_row < 2:
+            self.show_warning(
+                "Interpolate Keyframes",
+                "The selected keyframes need at least one frame between them.",
+            )
+            return
+
+        self.save_current_annotations()
+        first_annotations = self.all_annotations.get(first_name, {})
+        second_annotations = self.all_annotations.get(second_name, {})
+        if not first_annotations or not second_annotations:
+            self.show_warning(
+                "Interpolate Keyframes",
+                "Both selected frames need reviewed annotations.",
+            )
+            return
+
+        first_path = self.image_paths.get(first_name)
+        first_image = QImage(first_path) if first_path else QImage()
+        if first_image.isNull():
+            self.show_warning("Interpolate Keyframes", "The first frame could not be read.")
+            return
+
+        self.annotation_history.record(self.all_annotations, "keyframe interpolation")
+        created = 0
+        span = second_row - first_row
+        shape = (first_image.height(), first_image.width())
+        for row in range(first_row + 1, second_row):
+            frame_name = self.image_list.item(row).text()
+            if any(self.all_annotations.get(frame_name, {}).values()):
+                continue
+            fraction = (row - first_row) / span
+            interpolated = interpolate_annotations(
+                first_annotations,
+                second_annotations,
+                shape,
+                self.class_mapping,
+                fraction,
+            )
+            if interpolated:
+                self.all_annotations[frame_name] = interpolated
+                created += 1
+
+        if created:
+            self.auto_save()
+            self.refresh_studio_state()
+            self.saved_status_label.setText(f"Interpolated {created} frame(s)")
+        else:
+            self.saved_status_label.setText("No empty frames to interpolate")
+
+    def show_workflow_metrics(self):
+        summary = self.workflow_metrics.summary()
+        self.show_info(
+            "Session Metrics",
+            "Completed frames: {frames}\n"
+            "Average seconds per frame: {seconds:.1f}\n"
+            "Average actions per frame: {actions:.1f}\n"
+            "Average mouse travel per frame: {distance:.0f} px".format(
+                frames=summary["frames"],
+                seconds=summary["seconds_per_frame"],
+                actions=summary["actions_per_frame"],
+                distance=summary["mouse_distance_per_frame"],
+            ),
+        )
+
+    def adjust_overlay_opacity(self, delta):
+        self._overlay_opacity = min(0.9, max(0.1, self._overlay_opacity + delta))
+        self.image_label.fill_opacity = self._overlay_opacity
+        self.image_label.update()
+        self.saved_status_label.setText(
+            f"Mask opacity {round(self._overlay_opacity * 100)}%"
+        )
+
+    def _restore_annotation_state(self, state):
+        self._history_suspended = True
+        try:
+            self.all_annotations = copy.deepcopy(state)
+            self.load_image_annotations()
+            self.update_annotation_list()
+            self.update_slice_list_colors()
+            self.image_label.update()
+            self.auto_save()
+            self.refresh_studio_state()
+        finally:
+            self._history_suspended = False
+
+    def undo_annotations(self):
+        self._history_suspended = True
+        try:
+            self.save_current_annotations()
+        finally:
+            self._history_suspended = False
+        result = self.annotation_history.undo(self.all_annotations)
+        if result is None:
+            self.saved_status_label.setText("Nothing to undo")
+            return
+        label, state = result
+        self._restore_annotation_state(state)
+        self.saved_status_label.setText(f"Undid {label}")
+
+    def redo_annotations(self):
+        self._history_suspended = True
+        try:
+            self.save_current_annotations()
+        finally:
+            self._history_suspended = False
+        result = self.annotation_history.redo(self.all_annotations)
+        if result is None:
+            self.saved_status_label.setText("Nothing to redo")
+            return
+        label, state = result
+        self._restore_annotation_state(state)
+        self.saved_status_label.setText(f"Redid {label}")
+
+    def accept_and_go_to_next_frame(self):
+        """Accept the current review state, suggest the next mask, and advance."""
+        if self._sam3_inference_in_flight or not self.frame_sequence:
+            return
+        current_name = self.image_file_name
+        current_index = self.frame_sequence.index_for_name(current_name)
+        next_name = (
+            self.frame_sequence.name_for_index(current_index + 1)
+            if current_index is not None
+            else None
+        )
+        if not next_name:
+            return
+
+        self.save_current_annotations()
+        current_annotations = self.all_annotations.get(current_name, {})
+        for annotations in current_annotations.values():
+            for annotation in annotations:
+                if annotation.get("source") == "propagated_candidate":
+                    annotation["source"] = "propagated_accepted"
+
+        made_suggestion = False
+        confidences = []
+        if (
+            self._propagation_enabled
+            and current_annotations
+            and not any(self.all_annotations.get(next_name, {}).values())
+        ):
+            previous_path = self.image_paths.get(current_name)
+            next_path = self.image_paths.get(next_name)
+            previous_image = cv2.imread(previous_path) if previous_path else None
+            next_image = cv2.imread(next_path) if next_path else None
+            if previous_image is not None and next_image is not None:
+                suggestion = propagate_annotations(
+                    previous_image,
+                    next_image,
+                    current_annotations,
+                    self.class_mapping,
+                )
+                if suggestion:
+                    self.annotation_history.record(
+                        self.all_annotations, "accept and propagate"
+                    )
+                    self.all_annotations[next_name] = suggestion
+                    made_suggestion = True
+                    confidences = [
+                        annotation.get("confidence", 0.0)
+                        for annotations in suggestion.values()
+                        for annotation in annotations
+                    ]
+
+        self.workflow_metrics.enter_frame(current_name)
+        self.workflow_metrics.action()
+        self.workflow_metrics.commit()
+        self.auto_save()
+        self._navigate_to_image_or_slice(next_name)
+        self.workflow_metrics.enter_frame(next_name)
+        if made_suggestion:
+            confidence = sum(confidences) / len(confidences)
+            if confidence < 0.65:
+                self.saved_status_label.setProperty("uiRole", "warning")
+                self.saved_status_label.setText(
+                    f"Review suggestion ({confidence:.0%})"
+                )
+            else:
+                self.saved_status_label.setProperty("uiRole", "saved")
+                self.saved_status_label.setText(
+                    f"Suggestion ready ({confidence:.0%})"
+                )
+            self.saved_status_label.style().unpolish(self.saved_status_label)
+            self.saved_status_label.style().polish(self.saved_status_label)
     def go_to_next_frame(self):
         if self._sam3_inference_in_flight:
             return

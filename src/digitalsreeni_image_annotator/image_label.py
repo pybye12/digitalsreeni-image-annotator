@@ -293,6 +293,8 @@ class ImageLabel(QLabel):
                     self.main_window.add_annotation_to_list(new_annotation)
             self.temp_paint_mask = None
             self.main_window.save_current_annotations()
+            if hasattr(self.main_window, "auto_save"):
+                self.main_window.auto_save()
             self.main_window.update_slice_list_colors()
             self.update()
 
@@ -370,6 +372,8 @@ class ImageLabel(QLabel):
             self.main_window.update_annotation_list()
 
             self.main_window.save_current_annotations()
+            if hasattr(self.main_window, "auto_save"):
+                self.main_window.auto_save()
             self.main_window.update_slice_list_colors()
             self.update()
 
@@ -484,6 +488,8 @@ class ImageLabel(QLabel):
 
         self.temp_annotations.clear()
         self.main_window.save_current_annotations()
+        if hasattr(self.main_window, "auto_save"):
+            self.main_window.auto_save()
         self.main_window.update_slice_list_colors()
         self.update()
 
@@ -669,6 +675,18 @@ class ImageLabel(QLabel):
     def set_class_visibility(self, class_name, is_visible):
         self.class_visibility[class_name] = is_visible
 
+    def _draw_annotation_label(self, painter, point, text):
+        """Draw readable annotation text over both dark and bright footage."""
+        font = QFont("Arial", max(1, int(12 / self.zoom_factor)))
+        painter.setFont(font)
+        painter.setPen(QPen(QColor(0, 0, 0, 230)))
+        painter.drawText(
+            point + QPointF(1 / self.zoom_factor, 1 / self.zoom_factor),
+            text,
+        )
+        painter.setPen(QPen(Qt.GlobalColor.white))
+        painter.drawText(point, text)
+
     def draw_annotations(self, painter):
         """Draw all annotations on the image."""
         if not self.original_pixmap:
@@ -693,7 +711,6 @@ class ImageLabel(QLabel):
 
                 fill_color.setAlphaF(self.fill_opacity)
 
-                text_color = Qt.GlobalColor.white if self.dark_mode else Qt.GlobalColor.black
                 painter.setPen(QPen(border_color, 2 / self.zoom_factor, Qt.PenStyle.SolidLine))
                 painter.setBrush(QBrush(fill_color))
 
@@ -725,13 +742,8 @@ class ImageLabel(QLabel):
                         if points:
                             centroid = self.calculate_centroid(points)
                             if centroid:
-                                painter.setFont(
-                                    QFont("Arial", int(12 / self.zoom_factor))
-                                )
-                                painter.setPen(
-                                    QPen(text_color, 2 / self.zoom_factor, Qt.PenStyle.SolidLine)
-                                )
-                                painter.drawText(
+                                self._draw_annotation_label(
+                                    painter,
                                     centroid,
                                     f"{class_name} {annotation.get('number', '')}",
                                 )
@@ -739,9 +751,10 @@ class ImageLabel(QLabel):
                 elif "bbox" in annotation:
                     x, y, width, height = annotation["bbox"]
                     painter.drawRect(QRectF(x, y, width, height))
-                    painter.setPen(QPen(text_color, 2 / self.zoom_factor, Qt.PenStyle.SolidLine))
-                    painter.drawText(
-                        QPointF(x, y), f"{class_name} {annotation.get('number', '')}"
+                    self._draw_annotation_label(
+                        painter,
+                        QPointF(x, y),
+                        f"{class_name} {annotation.get('number', '')}",
                     )
 
         if self.current_annotation:

@@ -13,9 +13,9 @@ def test_video_menu_and_sam_controls_render(qtbot):
     action_labels = [action.text() for action in window.findChildren(QAction)]
 
     assert "Open Video &Clip..." in action_labels
-    assert window.sam3_init_btn.text() == "1. Prepare Loaded Frames"
-    assert window.sam3_track_forward_btn.text() == "2. Track Selected to End"
-    assert window.sam3_track_all_btn.text() == "Track All to End"
+    assert window.sam3_init_btn.text() == "Prepare sequence"
+    assert window.sam3_track_forward_btn.text() == "Track selected"
+    assert window.sam3_track_all_btn.text() == "Track all"
     assert window.sam3_init_btn.property("buttonRole") == "primary"
     assert "Images list" in window.sam3_init_btn.toolTip()
     assert "later loaded frames" in window.sam3_track_forward_btn.toolTip()
