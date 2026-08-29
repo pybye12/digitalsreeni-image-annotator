@@ -1,13 +1,10 @@
 # Welding Video Annotator
 
-A desktop app for drawing, reviewing, and exporting segmentation masks across
-images and long video sequences. It was built for the CCWJ lab team's
-high-speed welding annotation workflow.
-
-This fork is based on
+A desktop application for drawing segmentation labels on images and long video
+sequences. This fork is based on
 [DigitalSreeni Image Annotator](https://github.com/bnsreenu/digitalsreeni-image-annotator)
-and adds video-first navigation, assisted mask propagation, clearer review
-tools, and safer training-mask export.
+and adds a practical welding-video workflow, optional SAM 3 propagation, and
+safer training-mask export.
 
 The app runs locally. Images, videos, projects, and exported labels are not
 uploaded by the application.

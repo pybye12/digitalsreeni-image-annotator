@@ -19,7 +19,6 @@ setup(
     url="https://github.com/bnsreenu/digitalsreeni-image-annotator",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
-    package_data={"digitalsreeni_image_annotator": ["app.qss"]},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
