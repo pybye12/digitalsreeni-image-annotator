@@ -2337,6 +2337,24 @@ class ImageAnnotator(QMainWindow):
                 ):
                     self.slice_list.setCurrentRow(current_row + 1)
                 self.switch_slice(self.slice_list.currentItem())
+            elif self.class_list.hasFocus() or self.annotation_list.hasFocus():
+                # Let these lists handle their own up/down navigation
+                super().keyPressEvent(event)
+            elif self.image_list.count() > 0:
+                # Handle image navigation globally
+                current_row = self.image_list.currentRow()
+                new_row = current_row
+                if event.key() == Qt.Key.Key_Up and current_row > 0:
+                    new_row = current_row - 1
+                elif (
+                    event.key() == Qt.Key.Key_Down
+                    and current_row < self.image_list.count() - 1
+                ):
+                    new_row = current_row + 1
+                    
+                if new_row != current_row:
+                    self.image_list.setCurrentRow(new_row)
+                    self.switch_image(self.image_list.currentItem())
             else:
                 # Pass the event to the parent for default handling
                 super().keyPressEvent(event)
