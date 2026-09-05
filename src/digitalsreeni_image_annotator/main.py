@@ -26,6 +26,8 @@ def main():
     app = QApplication(sys.argv)
     window = ImageAnnotator()
     window.show()
+    window.raise_()
+    window.activateWindow()
     sys.exit(app.exec())
 
 if __name__ == "__main__":

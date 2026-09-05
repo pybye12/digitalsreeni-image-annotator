@@ -66,6 +66,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shapely.errors import GEOSException
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
@@ -5741,6 +5742,9 @@ class ImageAnnotator(QMainWindow):
 
             # Create a polygon from the current annotation
             polygon = Polygon(self.image_label.current_annotation)
+            if not polygon.is_valid:
+                # ponytail: freehand/click-drawn polygons can self-intersect; repair before intersecting
+                polygon = make_valid(polygon)
 
             # Define the image boundary as a rectangle
             image_boundary = Polygon(
@@ -5753,7 +5757,17 @@ class ImageAnnotator(QMainWindow):
             )
 
             # Intersect the polygon with the image boundary
-            clipped_polygon = polygon.intersection(image_boundary)
+            try:
+                clipped_polygon = polygon.intersection(image_boundary)
+            except GEOSException:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Annotation",
+                    "The drawn shape is self-intersecting and could not be processed. Please try drawing it again.",
+                )
+                self.image_label.clear_current_annotation()
+                self.image_label.update()
+                return
 
             if clipped_polygon.is_empty:
                 QMessageBox.warning(
