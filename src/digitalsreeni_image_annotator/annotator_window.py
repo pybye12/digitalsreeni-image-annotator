@@ -5601,7 +5601,10 @@ class ImageAnnotator(QMainWindow):
         class_name = item.text()
         current_color = self.image_label.class_colors.get(class_name, QColor(Qt.GlobalColor.white))
         color = QColorDialog.getColor(
-            current_color, self, f"Select Color for {class_name}"
+            current_color, 
+            self, 
+            f"Select Color for {class_name}",
+            options=QColorDialog.ColorDialogOption.DontUseNativeDialog
         )
 
         if color.isValid():
