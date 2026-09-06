@@ -1,3 +1,11 @@
+## ⚠️ This repository has moved
+
+Active development is at **[pybye12/welding-video-annotator](https://github.com/pybye12/welding-video-annotator)**.
+
+This fork is frozen at 29 Aug 2026 and is missing the lab workflow UI, the SAM 3
+review workflow, and several crash fixes. Do not fork or clone this one — use the
+link above.
+
 # Welding Video Annotator
 
 A desktop application for drawing segmentation labels on images and long video
