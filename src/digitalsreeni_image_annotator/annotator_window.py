@@ -66,6 +66,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shapely.errors import GEOSException
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
@@ -2341,6 +2342,24 @@ class ImageAnnotator(QMainWindow):
                 ):
                     self.slice_list.setCurrentRow(current_row + 1)
                 self.switch_slice(self.slice_list.currentItem())
+            elif self.class_list.hasFocus() or self.annotation_list.hasFocus():
+                # Let these lists handle their own up/down navigation
+                super().keyPressEvent(event)
+            elif self.image_list.count() > 0:
+                # Handle image navigation globally
+                current_row = self.image_list.currentRow()
+                new_row = current_row
+                if event.key() == Qt.Key.Key_Up and current_row > 0:
+                    new_row = current_row - 1
+                elif (
+                    event.key() == Qt.Key.Key_Down
+                    and current_row < self.image_list.count() - 1
+                ):
+                    new_row = current_row + 1
+                    
+                if new_row != current_row:
+                    self.image_list.setCurrentRow(new_row)
+                    self.switch_image(self.image_list.currentItem())
             else:
                 # Pass the event to the parent for default handling
                 super().keyPressEvent(event)
@@ -5809,7 +5828,10 @@ class ImageAnnotator(QMainWindow):
         class_name = item.text()
         current_color = self.image_label.class_colors.get(class_name, QColor(Qt.GlobalColor.white))
         color = QColorDialog.getColor(
-            current_color, self, f"Select Color for {class_name}"
+            current_color, 
+            self, 
+            f"Select Color for {class_name}",
+            options=QColorDialog.ColorDialogOption.DontUseNativeDialog
         )
 
         if color.isValid():
@@ -5968,6 +5990,9 @@ class ImageAnnotator(QMainWindow):
 
             # Create a polygon from the current annotation
             polygon = Polygon(self.image_label.current_annotation)
+            if not polygon.is_valid:
+                # ponytail: freehand/click-drawn polygons can self-intersect; repair before intersecting
+                polygon = make_valid(polygon)
 
             # Define the image boundary as a rectangle
             image_boundary = Polygon(
@@ -5980,7 +6005,17 @@ class ImageAnnotator(QMainWindow):
             )
 
             # Intersect the polygon with the image boundary
-            clipped_polygon = polygon.intersection(image_boundary)
+            try:
+                clipped_polygon = polygon.intersection(image_boundary)
+            except GEOSException:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Annotation",
+                    "The drawn shape is self-intersecting and could not be processed. Please try drawing it again.",
+                )
+                self.image_label.clear_current_annotation()
+                self.image_label.update()
+                return
 
             if clipped_polygon.is_empty:
                 QMessageBox.warning(

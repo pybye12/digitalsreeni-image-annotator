@@ -6,6 +6,8 @@ ER70S6_CLASSES = [
     ("droplet", QColor(255, 0, 0)),
     ("external_arc", QColor(0, 0, 255)),
     ("internal_arc", QColor(255, 255, 0)),
+    ("weld_pool", QColor(255, 0, 255)),
+    ("spatter", QColor(0, 255, 255)),
 ]
 
 ER70S6_CAVITAR_CLASSES = ER70S6_CLASSES[:2]
@@ -29,5 +31,7 @@ with the wire to its contact with the workpiece.
 Internal arc (yellow): the inner metal-vapor arc, whether or not it currently
 touches the molten consumable.
 
-Leave the weld pool and spatter as background.
+Weld pool (magenta): the liquid weld pool on the workpiece.
+
+Spatter (cyan): any expelled droplets and spatter separate from the main droplet.
 """

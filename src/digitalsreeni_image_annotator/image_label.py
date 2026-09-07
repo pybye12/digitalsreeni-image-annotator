@@ -1101,6 +1101,10 @@ class ImageLabel(QLabel):
                 self.discard_eraser_changes()
             else:
                 self.cancel_current_annotation()
+        elif event.key() == Qt.Key.Key_Z and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.current_tool == "polygon" and self.current_annotation:
+                self.current_annotation.pop()
+                self.update()
         elif event.key() == Qt.Key.Key_Delete:
             if self.editing_polygon:
                 self.main_window.delete_selected_annotations()
